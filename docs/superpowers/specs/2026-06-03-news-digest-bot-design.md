@@ -128,20 +128,50 @@
 - **FR-7.6** Команды: `/start`, `/digest`, `/topics`, `/threshold`, `/schedule`, `/alerts` (Pro), `/sources` (Pro), `/buy` (Pro), `/settings` (главное меню), `/help`.
 
 ### 3.8 Подписка и монетизация (фаза 2+)
-- **FR-8.1** Два тира: `free`, `pro`.
+- **FR-8.1** Два тира: `free`, `pro`. При первом `/start` юзер автоматически получает **7-дневный Pro trial**, после чего downgrade в `free` (если не оплатил).
 - **FR-8.2** Free ограничения:
-  - До 3 активных тем (только из пресетов).
-  - До 2 времён digest в сутки.
+  - До **2** активных тем (только из пресетов).
+  - Digest **2 раза/сутки в фиксированное время** (`08:00` и `19:00` локально юзеру).
+  - On-demand `/digest`: **1 раз/сутки**.
+  - Глубина истории: **24 часа**.
   - Только пресет-источники.
-  - Без alerts, без weekly, без кастом-тем.
+  - Без alerts, без weekly, без кастом-тем, без кастом-источников.
+  - Низкий приоритет в очереди доставки.
 - **FR-8.3** Pro:
   - Безлимит тем (включая кастомные).
-  - Безлимит времён digest.
+  - Кастомное расписание digest (произвольные времена + tz).
+  - On-demand `/digest`: безлимит.
+  - Глубина истории: 7 дней.
   - Alerts + weekly.
   - Кастомные источники до N каналов (фаза 3, N конкретизируем при запуске).
+  - Высокий приоритет в очереди доставки.
+  - Доступ ко всем будущим AI-фичам.
 - **FR-8.4** Подписка покупается через `PaymentProvider` интерфейс. Реализации: TG Stars (фаза 2), ЮКасса (фаза 3).
-- **FR-8.5** Истечение подписки: переход в free, лишние темы/источники деактивируются (не удаляются), при апгрейде восстанавливаются.
+- **FR-8.5** Истечение подписки/trial: переход в free, лишние темы/источники деактивируются (не удаляются), при апгрейде восстанавливаются.
 - **FR-8.6** Идемпотентность платежей: `UNIQUE(provider, provider_ref)` в `subscriptions`.
+- **FR-8.7** Trial используется один раз на `tg_user_id`. Повторный `/start` после истечения не запускает новый trial.
+
+### 3.9 Cost Containment (Token Economy)
+
+Бизнес-модель устойчива только если **+1 Free юзер не увеличивает LLM-расходы**. Гарантируется инвариантами:
+
+- **INV-1 (Shared AI):** Операции стоимостью O(clusters) — дедуп, классификация, severity, headline, summary — выполняются один раз на кластер и амортизируются по всем юзерам. Доступны Free.
+- **INV-2 (Personal AI):** Любая AI-операция стоимостью O(users) — кастом-классификация, чат с ботом, перевод, deep-summary, персонализированное ранжирование — **только Pro**. Новые AI-фичи добавляются под этот инвариант.
+- **INV-3 (Per-user prompt contribution):** Free юзер ничего не добавляет в prompt shared-классификатора (нет кастом-тем). Pro кастом-темы повышают токены classifier prompt, но Pro платит за это.
+- **INV-4 (On-demand cap):** On-demand операции для Free лимитированы суткам (1 `/digest`), чтобы будущие deep-features нельзя было прокачивать бесплатно.
+
+**Глобальный budget guard:**
+- Конфигурируемый `monthly_llm_budget_usd`.
+- При достижении 80% — алерт админу.
+- При достижении 90% — **degraded mode для Free**: новые посты не запускают LLM-merge (только MinHash + embeddings), кластеры без headline/summary показываются с заголовком = первое предложение топ-поста. Pro работает в полном объёме.
+- При 100% — Free доставки полностью паузятся, Pro работает.
+
+**Приоритизация очередей:**
+- Bot API отправка делится на два потока: `delivery.pro`, `delivery.free`. Pro обрабатывается первым.
+- При rate-limit от TG деградируют сначала Free доставки.
+
+**Capacity cap:**
+- `max_free_users` в конфиге. При overflow `/start` для новых Free попадают в waitlist (Pro регистрация всегда открыта).
 
 ---
 
@@ -304,6 +334,7 @@ users (
   tg_username     text,
   tier            text DEFAULT 'free',
   tier_until      timestamptz NULL,
+  trial_used      bool DEFAULT false,
   lang            text DEFAULT 'ru',
   blocked         bool DEFAULT false,
   created_at      timestamptz
@@ -379,6 +410,8 @@ subscriptions (
 | `cluster.updated` | dedup-worker | classifier, ranker | `{cluster_id}` |
 | `cluster.scored` | ranker | alerter | `{cluster_id, score, topics}` |
 | `delivery.scheduled` | scheduler | digest-assembler | `{user_id, channel}` |
+| `delivery.pro` | digest-assembler | bot-api-sender | `{user_id, msg}` |
+| `delivery.free` | digest-assembler | bot-api-sender (low prio) | `{user_id, msg}` |
 
 Все consumers — `ack_explicit`, retries до 5, далее `*.dlq`.
 
@@ -421,6 +454,8 @@ subscriptions (
 | Embeddings | 50% errors / 1min | дедуп только по MinHash |
 | Postgres | connection refused | session-reader → disk-buffer, workers пауза |
 | Bot API | 50% errors / 1min | очередь отправки, retry до 6ч, потом drop |
+| LLM monthly budget | 90% spent | Free → degraded (no LLM-merge/headline/summary), Pro — full |
+| LLM monthly budget | 100% spent | Free доставки паузятся, Pro — full |
 
 ### 7.4 Лимиты и backpressure
 
@@ -442,7 +477,9 @@ subscriptions (
 - `cluster_size_bucket`, `cluster_lifetime_seconds`
 - `llm_calls_total{purpose}`, `llm_tokens_total{purpose}`, `llm_cost_usd_total`
 - `digest_sent_total{tier,channel}`, `digest_assemble_seconds`
-- `subscription_active_gauge{tier}`
+- `subscription_active_gauge{tier}`, `trial_active_gauge`
+- `llm_budget_used_ratio{period=monthly}`
+- `delivery_queue_depth{tier}`
 - `cb_state{component}`, `queue_depth{stream}`
 
 **Алерты:** session ban, DLQ depth > 0, pipeline lag > 5мин, LLM cost > daily budget × 1.5, CB open > 5мин.
