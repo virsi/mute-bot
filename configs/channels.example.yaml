@@ -1,0 +1,7 @@
+channels:
+  - username: "ria_novosti"
+    authority_score: 80
+  - username: "bbcrussian"
+    authority_score: 75
+  - username: "meduzalive"
+    authority_score: 70

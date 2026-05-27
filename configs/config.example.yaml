@@ -1,0 +1,14 @@
+postgres_dsn: "postgres://mute:mute@localhost:5432/mute?sslmode=disable"
+redis_addr:   "localhost:6379"
+nats_url:     "nats://localhost:4222"
+bot_token:    "REPLACE_ME"
+openai_api_key: "REPLACE_ME"
+channels_file: "configs/channels.yaml"
+mtproto:
+  api_id: 0
+  api_hash: "REPLACE_ME"
+  session_path: ".session"
+llm:
+  monthly_budget_usd: 50
+  embedding_model: "text-embedding-3-small"
+  classifier_model: "gpt-4o-mini"
