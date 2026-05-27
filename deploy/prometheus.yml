@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: mute-bot
+    static_configs:
+      - targets:
+          - "host.docker.internal:9101"   # session-reader
+          - "host.docker.internal:9102"   # processor
+          - "host.docker.internal:9103"   # bot-api
+          - "host.docker.internal:9104"   # scheduler
