@@ -1,0 +1,11 @@
+.DS_Store
+
+bin/
+*.test
+*.out
+.env
+.env.local
+coverage.out
+.idea/
+.vscode/
+.session
