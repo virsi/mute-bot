@@ -47,6 +47,25 @@ func (r *ChannelsRepo) Upsert(ctx context.Context, in ChannelInsert) (int64, err
 	return id, nil
 }
 
+// ResolveOrCreate returns the internal id for tgID, inserting a placeholder
+// channel row if one does not yet exist. Unlike Upsert it preserves
+// previously-set username/title/authority — it is intended for hot paths
+// (normalizer) that only know the tg-side channel id and must keep moving
+// even if metadata has not been backfilled yet.
+func (r *ChannelsRepo) ResolveOrCreate(ctx context.Context, tgID int64) (int64, error) {
+	const q = `
+		INSERT INTO channels (tg_channel_id)
+		VALUES ($1)
+		ON CONFLICT (tg_channel_id) DO UPDATE
+		   SET tg_channel_id = EXCLUDED.tg_channel_id
+		RETURNING id`
+	var id int64
+	if err := r.p.Pool().QueryRow(ctx, q, tgID).Scan(&id); err != nil {
+		return 0, fmt.Errorf("resolve or create channel: %w", err)
+	}
+	return id, nil
+}
+
 // GetByTGID looks up a channel by its Telegram-side identifier.
 func (r *ChannelsRepo) GetByTGID(ctx context.Context, tgID int64) (Channel, error) {
 	const q = `

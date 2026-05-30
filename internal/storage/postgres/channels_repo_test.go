@@ -43,6 +43,46 @@ func TestChannelsRepo_UpsertAndGet(t *testing.T) {
 	require.Equal(t, 85, got2.Authority)
 }
 
+func TestChannelsRepo_ResolveOrCreate(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_DSN unset")
+	}
+	ctx := context.Background()
+	p, err := NewPool(ctx, dsn)
+	require.NoError(t, err)
+	defer p.Close()
+	_, err = p.Pool().Exec(ctx, "TRUNCATE channels RESTART IDENTITY CASCADE")
+	require.NoError(t, err)
+
+	r := NewChannelsRepo(p)
+
+	id1, err := r.ResolveOrCreate(ctx, 555)
+	require.NoError(t, err)
+	require.Greater(t, id1, int64(0))
+
+	// Same tg_channel_id → same internal id (idempotent).
+	id2, err := r.ResolveOrCreate(ctx, 555)
+	require.NoError(t, err)
+	require.Equal(t, id1, id2)
+
+	// A different tg_channel_id → a fresh internal id.
+	id3, err := r.ResolveOrCreate(ctx, 777)
+	require.NoError(t, err)
+	require.NotEqual(t, id1, id3)
+
+	// ResolveOrCreate must not overwrite previously-set username/title/authority.
+	_, err = r.Upsert(ctx, ChannelInsert{TGChannelID: 555, Username: "ria", Title: "RIA", Authority: 80})
+	require.NoError(t, err)
+	id4, err := r.ResolveOrCreate(ctx, 555)
+	require.NoError(t, err)
+	require.Equal(t, id1, id4)
+	got, err := r.GetByTGID(ctx, 555)
+	require.NoError(t, err)
+	require.Equal(t, "ria", got.Username)
+	require.Equal(t, 80, got.Authority)
+}
+
 func TestChannelsRepo_ListActive(t *testing.T) {
 	dsn := os.Getenv("POSTGRES_DSN")
 	if dsn == "" {
