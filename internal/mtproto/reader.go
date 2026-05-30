@@ -58,10 +58,25 @@ func ExtractRawPost(msg tg.MessageClass) (domain.RawPost, bool) {
 	}, true
 }
 
-// Run drives the gotd client until ctx is cancelled. Authentication must
-// already have happened (see Authenticate). The function blocks while the
-// updates manager processes the stream.
-func (r *Reader) Run(ctx context.Context) error {
+// Run wraps gotd's client.Run with an authentication step and an updates
+// manager bound to the channel-message dispatcher. authenticate is invoked
+// after the MTProto handshake completes but before subscribing to updates;
+// pass mtproto.Authenticate (or a no-op for a pre-seeded session).
+func (r *Reader) Run(ctx context.Context, authenticate func(ctx context.Context) error) error {
+	return r.client.Run(ctx, func(ctx context.Context) error {
+		if authenticate != nil {
+			if err := authenticate(ctx); err != nil {
+				return fmt.Errorf("authenticate: %w", err)
+			}
+		}
+		return r.serve(ctx)
+	})
+}
+
+// serve runs the updates manager inside an already-running gotd client.
+// Split out so callers that manage client.Run themselves (tests, custom
+// orchestration) can drive the dispatcher directly.
+func (r *Reader) serve(ctx context.Context) error {
 	dispatcher := tg.NewUpdateDispatcher()
 	dispatcher.OnNewChannelMessage(func(ctx context.Context, _ tg.Entities, u *tg.UpdateNewChannelMessage) error {
 		rp, ok := ExtractRawPost(u.Message)
@@ -80,21 +95,19 @@ func (r *Reader) Run(ctx context.Context) error {
 
 	mgr := updates.New(updates.Config{Handler: dispatcher})
 
-	return r.client.Run(ctx, func(ctx context.Context) error {
-		status, err := r.client.Auth().Status(ctx)
-		if err != nil {
-			return fmt.Errorf("auth status: %w", err)
-		}
-		if !status.Authorized {
-			return fmt.Errorf("session not authorized; run Authenticate before Run")
-		}
-		return mgr.Run(ctx, r.client.API(), status.User.GetID(), updates.AuthOptions{
-			IsBot: false,
-			OnStart: func(_ context.Context) {
-				slog.Info("mtproto: updates manager started",
-					slog.Int64("user_id", status.User.GetID()),
-				)
-			},
-		})
+	status, err := r.client.Auth().Status(ctx)
+	if err != nil {
+		return fmt.Errorf("auth status: %w", err)
+	}
+	if !status.Authorized {
+		return fmt.Errorf("session not authorized")
+	}
+	return mgr.Run(ctx, r.client.API(), status.User.GetID(), updates.AuthOptions{
+		IsBot: false,
+		OnStart: func(_ context.Context) {
+			slog.Info("mtproto: updates manager started",
+				slog.Int64("user_id", status.User.GetID()),
+			)
+		},
 	})
 }
