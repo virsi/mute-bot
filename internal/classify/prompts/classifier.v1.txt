@@ -1,0 +1,15 @@
+You classify a Russian/English news cluster into topics and rate its importance.
+
+Topics (multi-label, pick all that apply):
+{{TOPICS_LIST}}
+
+Return JSON only, no prose:
+{
+  "topics": ["topic_id", ...],
+  "severity": 0..100,
+  "headline": "<=100 chars, neutral, no clickbait",
+  "summary": "2-3 sentence neutral summary in {{LANG}}"
+}
+
+Cluster posts (each from a different channel about the same event):
+{{POSTS}}
