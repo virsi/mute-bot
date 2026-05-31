@@ -103,6 +103,34 @@ func (r *ClustersRepo) Get(ctx context.Context, id int64) (Cluster, error) {
 	return c, nil
 }
 
+// Snapshot is the read model fed to the ranker. MaxAuthority is the highest
+// authority score across the channels that have posted into the cluster.
+type Snapshot struct {
+	Coverage     int
+	Severity     int
+	MaxAuthority int
+}
+
+// Snapshot returns the ranking-relevant aggregates for clusterID. Joining
+// through posts→channels keeps the query a single round-trip; the LEFT JOINs
+// preserve the row when no posts are attached yet (coverage stays 0/severity
+// stays whatever has been written, max_auth becomes 0).
+func (r *ClustersRepo) Snapshot(ctx context.Context, id int64) (Snapshot, error) {
+	const q = `
+		SELECT c.coverage, c.severity,
+		       COALESCE(MAX(ch.authority_score), 0) AS max_auth
+		FROM clusters c
+		LEFT JOIN posts    p  ON p.cluster_id = c.id
+		LEFT JOIN channels ch ON ch.id = p.channel_id
+		WHERE c.id = $1
+		GROUP BY c.id`
+	var s Snapshot
+	if err := r.p.Pool().QueryRow(ctx, q, id).Scan(&s.Coverage, &s.Severity, &s.MaxAuthority); err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot cluster %d: %w", id, err)
+	}
+	return s, nil
+}
+
 // Search returns active clusters matching the filter, score-descending.
 // Topics is matched as set overlap (&&). Empty ExcludeIDs is fine — the
 // generated empty bigint[] simply matches nothing.
