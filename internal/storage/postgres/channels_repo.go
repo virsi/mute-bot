@@ -81,6 +81,36 @@ func (r *ChannelsRepo) GetByTGID(ctx context.Context, tgID int64) (Channel, erro
 	return c, nil
 }
 
+// SourcesForCluster returns the distinct, non-empty usernames of the
+// channels that contributed posts to clusterID. The digest formatter renders
+// these as "@username" tokens. Order is unspecified.
+func (r *ChannelsRepo) SourcesForCluster(ctx context.Context, clusterID int64) ([]string, error) {
+	const q = `
+		SELECT DISTINCT COALESCE(ch.username, '')
+		FROM posts p
+		JOIN channels ch ON ch.id = p.channel_id
+		WHERE p.cluster_id = $1
+		  AND ch.username IS NOT NULL
+		  AND ch.username <> ''`
+	rows, err := r.p.Pool().Query(ctx, q, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("sources for cluster: %w", err)
+	}
+	defer rows.Close()
+	out := make([]string, 0, 8)
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, fmt.Errorf("scan source: %w", err)
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows err: %w", err)
+	}
+	return out, nil
+}
+
 // ListActive returns all channels with active = true, ordered by id.
 func (r *ChannelsRepo) ListActive(ctx context.Context) ([]Channel, error) {
 	const q = `
