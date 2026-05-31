@@ -56,6 +56,21 @@ func (r *PostsRepo) Insert(ctx context.Context, in PostInsert) (int64, error) {
 	return id, nil
 }
 
+// GetClusterID returns the cluster id attached to postID, or 0 if the post
+// is not yet clustered. Used by the dedup matcher to evaluate MinHash and
+// embedding candidates.
+func (r *PostsRepo) GetClusterID(ctx context.Context, postID int64) (int64, error) {
+	const q = `SELECT cluster_id FROM posts WHERE id = $1`
+	var cid *int64
+	if err := r.p.Pool().QueryRow(ctx, q, postID).Scan(&cid); err != nil {
+		return 0, fmt.Errorf("get cluster id: %w", err)
+	}
+	if cid == nil {
+		return 0, nil
+	}
+	return *cid, nil
+}
+
 // AttachCluster links a post to a cluster.
 func (r *PostsRepo) AttachCluster(ctx context.Context, postID, clusterID int64) error {
 	if _, err := r.p.Pool().Exec(ctx,
