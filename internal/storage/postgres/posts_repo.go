@@ -80,6 +80,41 @@ func (r *PostsRepo) AttachCluster(ctx context.Context, postID, clusterID int64) 
 	return nil
 }
 
+// ListTextsByCluster returns up to 10 cleaned post texts (oldest first) and
+// the language of the first post attached to the cluster. Used by the
+// classifier worker to assemble its prompt. The 10-post cap keeps prompt
+// length under control for runaway clusters; the classifier itself further
+// trims to a handful inside the prompt.
+func (r *PostsRepo) ListTextsByCluster(ctx context.Context, clusterID int64) ([]string, string, error) {
+	const q = `
+		SELECT text_clean, COALESCE(lang, 'ru')
+		FROM posts
+		WHERE cluster_id = $1
+		ORDER BY posted_at
+		LIMIT 10`
+	rows, err := r.p.Pool().Query(ctx, q, clusterID)
+	if err != nil {
+		return nil, "", fmt.Errorf("list texts by cluster: %w", err)
+	}
+	defer rows.Close()
+	texts := make([]string, 0, 8)
+	var lang string
+	for rows.Next() {
+		var t, l string
+		if err := rows.Scan(&t, &l); err != nil {
+			return nil, "", fmt.Errorf("scan post text: %w", err)
+		}
+		texts = append(texts, t)
+		if lang == "" {
+			lang = l
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("rows err: %w", err)
+	}
+	return texts, lang, nil
+}
+
 // ListByCluster returns all posts attached to clusterID, oldest first.
 func (r *PostsRepo) ListByCluster(ctx context.Context, clusterID int64) ([]Post, error) {
 	const q = `
