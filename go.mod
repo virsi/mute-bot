@@ -3,9 +3,11 @@ module github.com/virsi/mute-bot
 go 1.26.1
 
 require (
+	github.com/go-co-op/gocron/v2 v2.21.2
 	github.com/go-telegram/bot v1.21.0
 	github.com/gotd/td v0.145.1
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jonboulle/clockwork v0.5.0
 	github.com/nats-io/nats.go v1.52.0
 	github.com/pgvector/pgvector-go v0.4.0
 	github.com/pgvector/pgvector-go/pgx v0.4.0
@@ -39,6 +41,7 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/ogen-go/ogen v1.20.3 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/rogpeppe/go-internal v1.15.0 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
