@@ -3,6 +3,7 @@ module github.com/virsi/mute-bot
 go 1.26.1
 
 require (
+	github.com/go-telegram/bot v1.21.0
 	github.com/gotd/td v0.145.1
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/nats-io/nats.go v1.52.0
