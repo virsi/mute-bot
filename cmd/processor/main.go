@@ -109,7 +109,7 @@ func run() error {
 	// embedder and the classifier so the monthly cap covers the whole
 	// pipeline rather than per-component sub-caps.
 	budget := llm.NewBudgetGuard(llm.BudgetConfig{MonthlyUSD: cfg.LLM.MonthlyBudgetUSD})
-	llmClient := llm.NewOpenAI(llm.OpenAIConfig{APIKey: cfg.OpenAIAPIKey, Budget: budget})
+	llmClient := llm.NewOpenAI(llm.OpenAIConfig{APIKey: cfg.OpenAIAPIKey, BaseURL: cfg.LLM.BaseURL, Budget: budget})
 
 	// Dedup pipeline.
 	minhashIdx := rdb.NewMinHashIndex(rclient, rdb.MinHashIndexConfig{Bands: 16, RowsPerBand: 8})

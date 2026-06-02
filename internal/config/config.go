@@ -30,6 +30,7 @@ type LLM struct {
 	MonthlyBudgetUSD float64 `yaml:"monthly_budget_usd"`
 	EmbeddingModel   string  `yaml:"embedding_model"`
 	ClassifierModel  string  `yaml:"classifier_model"`
+	BaseURL          string  `yaml:"openai_base_url"`
 }
 
 func Load(path string) (*Config, error) {
@@ -54,7 +55,8 @@ func applyEnvOverrides(c *Config) {
 		"MUTE_REDIS_ADDR":     &c.RedisAddr,
 		"MUTE_NATS_URL":       &c.NATSURL,
 		"MUTE_BOT_TOKEN":      &c.BotToken,
-		"MUTE_OPENAI_API_KEY": &c.OpenAIAPIKey,
+		"MUTE_OPENAI_API_KEY":  &c.OpenAIAPIKey,
+		"MUTE_OPENAI_BASE_URL": &c.LLM.BaseURL,
 	}
 	for k, p := range overrides {
 		if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
