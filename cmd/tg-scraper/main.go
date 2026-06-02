@@ -56,6 +56,16 @@ func run() error {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	shutdownTracing, err := obs.SetupTracing(rootCtx, "tg-scraper", cfg.OTLPEndpoint)
+	if err != nil {
+		return fmt.Errorf("setup tracing: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelShutdown()
+		_ = shutdownTracing(shutdownCtx)
+	}()
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
