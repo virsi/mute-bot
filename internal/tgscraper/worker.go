@@ -129,7 +129,7 @@ func (w *Worker) pollChannel(ctx context.Context, ch ChannelSpec) error {
 		return fmt.Errorf("parse: %w", err)
 	}
 
-	var maxSeen int64 = lastSeen
+	maxSeen := lastSeen
 	published := 0
 	for _, p := range posts {
 		if p.TGMsgID <= lastSeen {

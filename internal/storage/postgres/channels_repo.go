@@ -1,3 +1,7 @@
+// Package postgres provides pgxpool-backed repositories for each aggregate
+// root (channels, posts, clusters, users, settings, subscriptions,
+// deliveries, user_topics, session_state). Each repo owns one table; the
+// Pool wrapper handles pgvector type registration.
 package postgres
 
 import (

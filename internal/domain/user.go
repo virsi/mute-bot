@@ -5,6 +5,7 @@ import "time"
 // Tier represents a user's subscription tier.
 type Tier string
 
+// Tier constants — Phase-2 ships only free and pro.
 const (
 	TierFree Tier = "free"
 	TierPro  Tier = "pro"

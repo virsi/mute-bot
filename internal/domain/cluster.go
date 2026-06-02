@@ -1,3 +1,5 @@
+// Package domain holds the pure types shared by the pipeline — posts,
+// clusters, users, topics. No I/O, no third-party imports beyond stdlib.
 package domain
 
 import "time"
