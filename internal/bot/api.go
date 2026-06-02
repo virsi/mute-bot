@@ -8,30 +8,27 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-// BotAPI is the concrete Bot API implementation backed by go-telegram/bot.
-// It implements the API interface that Sender calls through.
-//
-//nolint:revive // BotAPI is descriptive in the bot package context.
-type BotAPI struct {
+// SendOnly is the narrow Bot API client used by cmd/processor's digest
+// path. Provides exactly one method — Send — and intentionally hides the
+// long-polling surface so the processor cannot accidentally call
+// getUpdates and contend with cmd/bot-api.
+type SendOnly struct {
 	b *tgbot.Bot
 }
 
-// NewBotAPI constructs a BotAPI from a bot token. The underlying bot is not
-// started here — long-polling/update dispatch is M11's concern; this type is
-// just a thin Send adapter for the digest path.
-func NewBotAPI(token string) (*BotAPI, error) {
+// NewSendOnly constructs a SendOnly. It dials the Bot API to validate the
+// token; no long-polling loop is started.
+func NewSendOnly(token string) (*SendOnly, error) {
 	b, err := tgbot.New(token)
 	if err != nil {
 		return nil, fmt.Errorf("new bot: %w", err)
 	}
-	return &BotAPI{b: b}, nil
+	return &SendOnly{b: b}, nil
 }
 
-// Send implements API: it pushes a single HTML-parsed message to chatID.
-// Errors from the Telegram API are returned verbatim — Sender does not
-// distinguish between them yet.
-func (a *BotAPI) Send(ctx context.Context, chatID int64, text string) error {
-	_, err := a.b.SendMessage(ctx, &tgbot.SendMessageParams{
+// Send pushes a single HTML-parsed message to chatID. Implements API.
+func (s *SendOnly) Send(ctx context.Context, chatID int64, text string) error {
+	_, err := s.b.SendMessage(ctx, &tgbot.SendMessageParams{
 		ChatID:    chatID,
 		Text:      text,
 		ParseMode: models.ParseModeHTML,
@@ -42,6 +39,22 @@ func (a *BotAPI) Send(ctx context.Context, chatID int64, text string) error {
 	return nil
 }
 
-// Bot returns the underlying go-telegram/bot client for callers that need to
-// register handlers or run the long-polling loop (M11).
-func (a *BotAPI) Bot() *tgbot.Bot { return a.b }
+// Client is the full Bot API used by cmd/bot-api for long-polling, command
+// handlers, sendInvoice, and pre-checkout webhooks. Embeds SendOnly so it
+// satisfies the API interface used by Sender.
+type Client struct {
+	SendOnly
+}
+
+// NewClient constructs a Client.
+func NewClient(token string) (*Client, error) {
+	s, err := NewSendOnly(token)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{SendOnly: *s}, nil
+}
+
+// Bot returns the underlying go-telegram/bot client so cmd/bot-api can
+// register handlers and run long polling.
+func (c *Client) Bot() *tgbot.Bot { return c.b }

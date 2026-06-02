@@ -1,10 +1,13 @@
 // Package bot wraps the Telegram Bot API for the digest delivery path.
 //
-// Two pieces live here:
-//   - Sender: a transport-agnostic rate limiter that throttles outgoing
+// Three pieces live here:
+//   - Sender:   a transport-agnostic rate limiter that throttles outgoing
 //     messages per chat (token bucket). Implements digest.Sender.
-//   - BotAPI: the concrete go-telegram/bot adapter that Sender calls
-//     through the API interface (in api.go).
+//   - SendOnly: a narrow Bot API adapter exposing only Send. Used by the
+//     processor's digest path so it cannot start a long-polling loop and
+//     contend with cmd/bot-api.
+//   - Client:   the full Bot API used by cmd/bot-api for command handlers,
+//     long polling, and (Phase 2) payment webhooks. Embeds SendOnly.
 package bot
 
 import (

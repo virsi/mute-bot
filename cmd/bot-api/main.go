@@ -77,15 +77,15 @@ func run() error {
 	}
 	defer pool.Close()
 
-	api, err := bot.NewBotAPI(cfg.BotToken)
+	client, err := bot.NewClient(cfg.BotToken)
 	if err != nil {
-		return fmt.Errorf("new bot api: %w", err)
+		return fmt.Errorf("new bot client: %w", err)
 	}
-	// Sender wraps BotAPI with per-chat rate limiting for digest pushes.
-	// Slash-command replies bypass it — they go straight through BotAPI's
-	// API.Send because user-facing latency matters more than back-pressure
-	// at one message per command invocation.
-	sender := bot.NewSender(bot.SenderDeps{API: api, PerChatPerSec: 1})
+	// Sender wraps the bot client with per-chat rate limiting for digest
+	// pushes. Slash-command replies bypass it — they go straight through
+	// the client's Send because user-facing latency matters more than
+	// back-pressure at one message per command invocation.
+	sender := bot.NewSender(bot.SenderDeps{API: &client.SendOnly, PerChatPerSec: 1})
 
 	users := postgres.NewUsersRepo(pool)
 	settings := postgres.NewSettingsRepo(pool)
@@ -116,13 +116,13 @@ func run() error {
 		Users:     users,
 		Settings:  settings,
 		Assembler: asmAdapter,
-		API:       api,
+		API:       &client.SendOnly,
 	})
 
-	registerHandlers(api.Bot(), h)
+	registerHandlers(client.Bot(), h)
 
 	slog.Info("bot-api: starting long poll")
-	api.Bot().Start(rootCtx)
+	client.Bot().Start(rootCtx)
 	slog.Info("bot-api: stopped")
 	return nil
 }

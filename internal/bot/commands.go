@@ -58,7 +58,7 @@ func (f AssemblerFunc) Assemble(ctx context.Context, r AssembleReq) error { retu
 var _ AssemblerIface = AssemblerFunc(nil)
 
 // SendAPI is the minimal contract command handlers need to push plain-text
-// replies. Satisfied by *BotAPI in production.
+// replies. Satisfied by *Client (via embedded SendOnly) in production.
 type SendAPI interface {
 	Send(ctx context.Context, chatID int64, text string) error
 }
