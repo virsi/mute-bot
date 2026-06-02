@@ -155,6 +155,7 @@ func (c *Cron) scheduleUser(u UserSchedule) {
 		// get the correct UTC HH:MM under the user's current offset.
 		local := time.Date(now.Year(), now.Month(), now.Day(), hm.Hour(), hm.Minute(), 0, 0, loc)
 		utc := local.UTC()
+		// #nosec G115 -- utc.Hour() and utc.Minute() are bounded 0..59 by time package
 		atTime := gocron.NewAtTime(uint(utc.Hour()), uint(utc.Minute()), 0)
 
 		userID := u.UserID

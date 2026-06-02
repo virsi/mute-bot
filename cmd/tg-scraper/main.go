@@ -132,6 +132,7 @@ func run() error {
 }
 
 func loadChannels(path string) ([]tgscraper.ChannelSpec, error) {
+	// #nosec G304 -- path comes from --channels flag, operator-controlled
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read channels file: %w", err)

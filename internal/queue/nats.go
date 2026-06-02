@@ -109,7 +109,7 @@ func ensureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.Str
 	if !errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
 		// Some servers return the error wrapped; fall back to update either way.
 		if _, uerr := js.UpdateStream(ctx, cfg); uerr != nil {
-			return fmt.Errorf("ensure stream %s: create=%w update=%v", cfg.Name, err, uerr)
+			return fmt.Errorf("ensure stream %s: %w", cfg.Name, errors.Join(err, uerr))
 		}
 		return nil
 	}

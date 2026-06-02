@@ -2,10 +2,10 @@ package redis
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"time"
 )
@@ -99,10 +99,14 @@ func (m *MinHashIndex) Candidates(ctx context.Context, sig []uint32, limit int) 
 	return out, nil
 }
 
-// bandKey hashes the rows of one band into a deterministic Redis key. SHA-1
-// is used purely as a fixed-width digest — no security property is required.
+// bandKey hashes the rows of one band into a deterministic Redis key. FNV-64
+// is used purely as a fixed-width digest — no security property is required,
+// and FNV avoids the gosec G401/G505 warnings raised by sha1.
 func (m *MinHashIndex) bandKey(band int, rows []uint32) string {
 	raw, _ := json.Marshal(rows)
-	sum := sha1.Sum(raw)
-	return fmt.Sprintf("mh:b%d:%s", band, hex.EncodeToString(sum[:]))
+	h := fnv.New64a()
+	_, _ = h.Write(raw)
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], h.Sum64())
+	return fmt.Sprintf("mh:b%d:%x", band, buf)
 }

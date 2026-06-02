@@ -40,6 +40,7 @@ type LLM struct {
 
 // Load reads, env-expands and validates the YAML at path.
 func Load(path string) (*Config, error) {
+	// #nosec G304 -- path comes from --config flag, operator-controlled
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -57,10 +58,10 @@ func Load(path string) (*Config, error) {
 
 func applyEnvOverrides(c *Config) {
 	overrides := map[string]*string{
-		"MUTE_POSTGRES_DSN":   &c.PostgresDSN,
-		"MUTE_REDIS_ADDR":     &c.RedisAddr,
-		"MUTE_NATS_URL":       &c.NATSURL,
-		"MUTE_BOT_TOKEN":      &c.BotToken,
+		"MUTE_POSTGRES_DSN":    &c.PostgresDSN,
+		"MUTE_REDIS_ADDR":      &c.RedisAddr,
+		"MUTE_NATS_URL":        &c.NATSURL,
+		"MUTE_BOT_TOKEN":       &c.BotToken,
 		"MUTE_OPENAI_API_KEY":  &c.OpenAIAPIKey,
 		"MUTE_OPENAI_BASE_URL": &c.LLM.BaseURL,
 	}

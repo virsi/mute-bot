@@ -83,4 +83,3 @@ func TestCron_FiresPerUser(t *testing.T) {
 	require.Equal(t, int64(100), payload["tg_user_id"])
 	require.Equal(t, "digest", payload["channel"])
 }
-
