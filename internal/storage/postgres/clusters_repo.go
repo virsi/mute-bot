@@ -103,6 +103,34 @@ func (r *ClustersRepo) Get(ctx context.Context, id int64) (Cluster, error) {
 	return c, nil
 }
 
+// Merge moves every post attached to from onto into, sums coverage, and
+// marks from.status = 'merged' so it is excluded from future search. The
+// three writes share one transaction so a partial merge can never leak.
+func (r *ClustersRepo) Merge(ctx context.Context, into, from int64) error {
+	tx, err := r.p.Pool().Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`UPDATE posts SET cluster_id = $1 WHERE cluster_id = $2`, into, from); err != nil {
+		return fmt.Errorf("move posts: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE clusters
+		    SET coverage = coverage + (SELECT coverage FROM clusters WHERE id = $2),
+		        last_updated_at = now()
+		  WHERE id = $1`, into, from); err != nil {
+		return fmt.Errorf("sum coverage: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE clusters SET status = 'merged', last_updated_at = now() WHERE id = $1`,
+		from); err != nil {
+		return fmt.Errorf("mark merged: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
 // Snapshot is the read model fed to the ranker. MaxAuthority is the highest
 // authority score across the channels that have posted into the cluster.
 type Snapshot struct {

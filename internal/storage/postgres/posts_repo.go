@@ -71,6 +71,17 @@ func (r *PostsRepo) GetClusterID(ctx context.Context, postID int64) (int64, erro
 	return *cid, nil
 }
 
+// GetText returns text_clean for postID. Used by the dedup borderline
+// reconciler to assemble the LLMJudge prompt.
+func (r *PostsRepo) GetText(ctx context.Context, postID int64) (string, error) {
+	var t string
+	if err := r.p.Pool().QueryRow(ctx,
+		`SELECT text_clean FROM posts WHERE id = $1`, postID).Scan(&t); err != nil {
+		return "", fmt.Errorf("get text: %w", err)
+	}
+	return t, nil
+}
+
 // AttachCluster links a post to a cluster.
 func (r *PostsRepo) AttachCluster(ctx context.Context, postID, clusterID int64) error {
 	if _, err := r.p.Pool().Exec(ctx,
