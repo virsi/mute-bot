@@ -176,6 +176,30 @@ func registerHandlers(b *tgbot.Bot, h *bot.Handlers) {
 			}
 		},
 	)
+	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/schedule", tgbot.MatchTypePrefix,
+		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
+			if u.Message == nil || u.Message.From == nil {
+				return
+			}
+			parts := strings.Fields(u.Message.Text)
+			// /schedule with no args — fall back to /settings so the user
+			// can see the current schedule before editing it.
+			if len(parts) < 2 {
+				if err := h.HandleSettings(ctx, u.Message.From.ID, u.Message.From.Username); err != nil {
+					slog.Error("/schedule (no arg) failed", slog.Any("err", err))
+				}
+				return
+			}
+			timesCSV := parts[1]
+			tz := ""
+			if len(parts) >= 3 {
+				tz = parts[2]
+			}
+			if err := h.HandleSchedule(ctx, u.Message.From.ID, u.Message.From.Username, timesCSV, tz); err != nil {
+				slog.Error("/schedule failed", slog.Any("err", err))
+			}
+		},
+	)
 	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/topics", tgbot.MatchTypePrefix,
 		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
 			if u.Message == nil || u.Message.From == nil {

@@ -156,6 +156,97 @@ func TestSettings_RendersCurrentState(t *testing.T) {
 	require.Contains(t, msg, "Europe/Moscow")
 }
 
+func TestSchedule_UpdatesTimesAndTimezone(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{
+		Topics:       []string{"politics"},
+		Threshold:    50,
+		ScheduleJSON: json.RawMessage(`{"times":["08:00","19:00"],"tz":"Europe/Moscow"}`),
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleSchedule(context.Background(), 555, "alice", "09:30,21:00", "Europe/Berlin"))
+	require.NotEmpty(t, st.stored.ScheduleJSON, "schedule must be persisted")
+
+	var got struct {
+		Times []string `json:"times"`
+		TZ    string   `json:"tz"`
+	}
+	require.NoError(t, json.Unmarshal(st.stored.ScheduleJSON, &got))
+	require.Equal(t, []string{"09:30", "21:00"}, got.Times)
+	require.Equal(t, "Europe/Berlin", got.TZ)
+	// Other fields must be preserved (scheduler reload must see same topics/threshold).
+	require.Equal(t, []string{"politics"}, st.stored.Topics)
+	require.Equal(t, 50, st.stored.Threshold)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "09:30")
+	require.Contains(t, send.msgs[0], "21:00")
+	require.Contains(t, send.msgs[0], "Europe/Berlin")
+}
+
+func TestSchedule_DefaultsToMoscowWhenTZEmpty(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{Threshold: 50}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleSchedule(context.Background(), 555, "alice", "08:00", ""))
+
+	var got struct {
+		Times []string `json:"times"`
+		TZ    string   `json:"tz"`
+	}
+	require.NoError(t, json.Unmarshal(st.stored.ScheduleJSON, &got))
+	require.Equal(t, []string{"08:00"}, got.Times)
+	require.Equal(t, "Europe/Moscow", got.TZ)
+}
+
+func TestSchedule_RejectsMalformedTime(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{Threshold: 50}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleSchedule(context.Background(), 555, "alice", "08:00,25:99", "Europe/Moscow"))
+	require.Empty(t, st.stored.ScheduleJSON, "invalid time must not be persisted")
+	require.Len(t, send.msgs, 1)
+}
+
+func TestSchedule_RejectsEmptyTimes(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{Threshold: 50}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleSchedule(context.Background(), 555, "alice", "", "Europe/Moscow"))
+	require.Empty(t, st.stored.ScheduleJSON)
+	require.Len(t, send.msgs, 1)
+}
+
+func TestSchedule_PersistsForSchedulerReload(t *testing.T) {
+	// Scheduler reads settings via SettingsRepo.Get at each tick. Simulate the
+	// reload by reading the stored value back through Get after HandleSchedule.
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{Topics: []string{"it"}, Threshold: 60}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleSchedule(context.Background(), 555, "alice", "07:00,18:30", "Europe/Moscow"))
+
+	// Now flip Get to return what was just stored — what the scheduler would see.
+	st.get = postgres.Settings{
+		Topics:       st.stored.Topics,
+		Threshold:    st.stored.Threshold,
+		ScheduleJSON: st.stored.ScheduleJSON,
+	}
+	reloaded, err := st.Get(context.Background(), 1)
+	require.NoError(t, err)
+
+	var got struct {
+		Times []string `json:"times"`
+		TZ    string   `json:"tz"`
+	}
+	require.NoError(t, json.Unmarshal(reloaded.ScheduleJSON, &got))
+	require.Equal(t, []string{"07:00", "18:30"}, got.Times)
+	require.Equal(t, "Europe/Moscow", got.TZ)
+}
+
 func TestAssemblerFunc_AdaptsFunc(t *testing.T) {
 	called := false
 	var f AssemblerFunc = func(_ context.Context, _ AssembleReq) error {

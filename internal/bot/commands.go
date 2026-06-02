@@ -4,9 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/virsi/mute-bot/internal/storage/postgres"
 )
+
+// defaultScheduleTZ is the timezone applied when /schedule is invoked
+// without an explicit tz argument. Phase-1 ships RU-only, so Moscow is
+// the right default for the vast majority of users.
+const defaultScheduleTZ = "Europe/Moscow"
 
 // UsersRepo is the slice of postgres.UsersRepo the command handlers need.
 // Kept narrow so unit tests can substitute a fake.
@@ -84,6 +91,7 @@ const welcome = `Привет!
 /digest — сводка прямо сейчас
 /topics ID — включить/выключить тему
 /threshold N — порог важности 0..100
+/schedule HH:MM,HH:MM [TZ] — время доставки сводки
 /settings — текущие настройки
 
 По умолчанию: темы [politics, it], порог 50, расписание 08:00 и 19:00 (MSK).`
@@ -196,6 +204,61 @@ func (h *Handlers) HandleToggleTopic(ctx context.Context, tgUserID int64, userna
 		state = "выключена"
 	}
 	return h.d.API.Send(ctx, tgUserID, fmt.Sprintf("Тема %s: %s", topicID, state))
+}
+
+// HandleSchedule implements /schedule TIMES [TZ]. TIMES is a comma-separated
+// list of HH:MM values; TZ is an IANA zone identifier (defaults to
+// Europe/Moscow when empty). Every time is validated strictly via
+// time.Parse("15:04", t) — if any entry is malformed the row is left
+// untouched and the user gets a usage hint. The resulting JSON has the
+// same shape the scheduler expects: {"times":[...],"tz":"..."}.
+func (h *Handlers) HandleSchedule(ctx context.Context, tgUserID int64, username, timesCSV, tz string) error {
+	if strings.TrimSpace(timesCSV) == "" {
+		return h.d.API.Send(ctx, tgUserID,
+			"Использование: /schedule HH:MM,HH:MM [TZ]\nПример: /schedule 08:00,19:00 Europe/Moscow")
+	}
+	if strings.TrimSpace(tz) == "" {
+		tz = defaultScheduleTZ
+	}
+
+	raw := strings.Split(timesCSV, ",")
+	times := make([]string, 0, len(raw))
+	for _, t := range raw {
+		t = strings.TrimSpace(t)
+		if _, err := time.Parse("15:04", t); err != nil {
+			return h.d.API.Send(ctx, tgUserID,
+				fmt.Sprintf("Время %q должно быть в формате HH:MM (например 08:00).", t))
+		}
+		times = append(times, t)
+	}
+
+	u, _, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
+	if err != nil {
+		return fmt.Errorf("get_or_create user: %w", err)
+	}
+	s, err := h.d.Settings.Get(ctx, u.ID)
+	if err != nil {
+		return fmt.Errorf("get settings: %w", err)
+	}
+
+	sched, err := json.Marshal(map[string]any{"times": times, "tz": tz})
+	if err != nil {
+		return fmt.Errorf("marshal schedule: %w", err)
+	}
+
+	if err := h.d.Settings.Upsert(ctx, u.ID, postgres.SettingsUpdate{
+		Topics:         s.Topics,
+		Threshold:      s.Threshold,
+		ScheduleJSON:   sched,
+		AlertsEnabled:  s.AlertsEnabled,
+		AlertThreshold: s.AlertThreshold,
+		WeeklyEnabled:  s.WeeklyEnabled,
+	}); err != nil {
+		return fmt.Errorf("upsert settings: %w", err)
+	}
+
+	return h.d.API.Send(ctx, tgUserID,
+		fmt.Sprintf("Расписание обновлено: %s (%s).", strings.Join(times, ", "), tz))
 }
 
 // HandleSettings implements /settings. Renders the current row as a
