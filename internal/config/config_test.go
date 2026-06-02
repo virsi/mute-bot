@@ -55,3 +55,42 @@ func TestLoad_MissingRequired(t *testing.T) {
 	_, err := Load(path)
 	require.ErrorContains(t, err, "postgres_dsn is required")
 }
+
+func TestLoad_EnvSubst_Expands(t *testing.T) {
+	t.Setenv("DB_PASS", "s3cret")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+postgres_dsn: "postgres://mute:${DB_PASS}@localhost/mute"
+redis_addr: "localhost:6379"
+nats_url: "nats://localhost:4222"
+`), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, "postgres://mute:s3cret@localhost/mute", cfg.PostgresDSN)
+}
+
+func TestLoad_EnvSubst_MissingVarFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+postgres_dsn: "postgres://mute:${NOT_SET_ANYWHERE}@x/y"
+redis_addr: "x"
+nats_url: "x"
+`), 0o600))
+	_, err := Load(path)
+	require.ErrorContains(t, err, "NOT_SET_ANYWHERE")
+}
+
+func TestLoad_EnvSubst_NonMatchingPatternUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+postgres_dsn: "postgres://mute:literal$dollar@x/y"
+redis_addr: "x"
+nats_url: "x"
+`), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, "postgres://mute:literal$dollar@x/y", cfg.PostgresDSN)
+}
