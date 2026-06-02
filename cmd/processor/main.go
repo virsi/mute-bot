@@ -31,6 +31,7 @@ import (
 	"github.com/virsi/mute-bot/internal/digest"
 	"github.com/virsi/mute-bot/internal/llm"
 	"github.com/virsi/mute-bot/internal/normalize"
+	"github.com/virsi/mute-bot/internal/obs"
 	"github.com/virsi/mute-bot/internal/queue"
 	"github.com/virsi/mute-bot/internal/rank"
 	"github.com/virsi/mute-bot/internal/storage/postgres"
@@ -48,12 +49,17 @@ func run() error {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config yaml")
 	flag.Parse()
 
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(obs.NewLogger(slog.LevelInfo, "processor"))
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+
+	// Metrics endpoint on the processor slot. Started before any worker
+	// goroutine spins up so /healthz returns 200 the moment systemd checks.
+	metricsSrv := obs.ServeMetrics(":9102")
+	defer func() { _ = metricsSrv.Close() }()
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()

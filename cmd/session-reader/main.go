@@ -19,6 +19,7 @@ import (
 
 	"github.com/virsi/mute-bot/internal/config"
 	"github.com/virsi/mute-bot/internal/mtproto"
+	"github.com/virsi/mute-bot/internal/obs"
 	"github.com/virsi/mute-bot/internal/queue"
 	"github.com/virsi/mute-bot/internal/storage/postgres"
 )
@@ -34,13 +35,19 @@ func run() error {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config yaml")
 	flag.Parse()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(logger)
+	slog.SetDefault(obs.NewLogger(slog.LevelInfo, "session-reader"))
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+
+	// Metrics endpoint runs alongside the MTProto reader so Prometheus can
+	// scrape ingest counters even when the reader goroutine is blocked on
+	// Telegram I/O. Port 9101 is the session-reader slot in the obs scheme
+	// (9102 processor, 9103 bot-api, 9104 scheduler).
+	metricsSrv := obs.ServeMetrics(":9101")
+	defer func() { _ = metricsSrv.Close() }()
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()

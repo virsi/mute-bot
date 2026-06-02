@@ -22,6 +22,7 @@ import (
 	"github.com/virsi/mute-bot/internal/bot"
 	"github.com/virsi/mute-bot/internal/config"
 	"github.com/virsi/mute-bot/internal/digest"
+	"github.com/virsi/mute-bot/internal/obs"
 	"github.com/virsi/mute-bot/internal/storage/postgres"
 )
 
@@ -36,12 +37,17 @@ func run() error {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config yaml")
 	flag.Parse()
 
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(obs.NewLogger(slog.LevelInfo, "bot-api"))
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+
+	// Metrics endpoint on the bot-api slot. Exposes long-poll loop health
+	// and Bot API send counters scraped by Prometheus.
+	metricsSrv := obs.ServeMetrics(":9103")
+	defer func() { _ = metricsSrv.Close() }()
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
