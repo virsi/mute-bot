@@ -15,6 +15,7 @@ test-int:
 
 build:
 	$(GO) build -o bin/session-reader ./cmd/session-reader
+	$(GO) build -o bin/tg-scraper     ./cmd/tg-scraper
 	$(GO) build -o bin/processor      ./cmd/processor
 	$(GO) build -o bin/bot-api        ./cmd/bot-api
 	$(GO) build -o bin/scheduler      ./cmd/scheduler
