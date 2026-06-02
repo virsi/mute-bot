@@ -1,16 +1,17 @@
+version: "2"
+
 run:
   timeout: 5m
   go: "1.23"
 
 linters:
+  default: none
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
     - unused
-    - gofumpt
     - revive
     - gosec
     - bodyclose
@@ -18,8 +19,13 @@ linters:
     - nilerr
     - prealloc
     - unconvert
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
 
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters: [gosec, errcheck]
+formatters:
+  enable:
+    - gofumpt
