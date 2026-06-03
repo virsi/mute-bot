@@ -18,8 +18,7 @@ import (
 type RW interface {
 	GetOrCreate(ctx context.Context, tgUserID int64, username string) (postgres.User, bool, error)
 	GrantPro(ctx context.Context, id int64, dur time.Duration) error
-	ListExpired(ctx context.Context, asOf time.Time) ([]int64, error)
-	SetTier(ctx context.Context, id int64, tier string, until *time.Time) error
+	BulkDowngradeExpired(ctx context.Context, asOf time.Time) ([]int64, error)
 }
 
 // SettingsWriter is the slice used when seeding defaults for newly

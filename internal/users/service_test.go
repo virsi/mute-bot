@@ -27,14 +27,10 @@ func (m *mockUsers) GrantPro(ctx context.Context, id int64, dur time.Duration) e
 	return m.Called(ctx, id, dur).Error(0)
 }
 
-func (m *mockUsers) ListExpired(ctx context.Context, asOf time.Time) ([]int64, error) {
+func (m *mockUsers) BulkDowngradeExpired(ctx context.Context, asOf time.Time) ([]int64, error) {
 	args := m.Called(ctx, asOf)
 	ids, _ := args.Get(0).([]int64)
 	return ids, args.Error(1)
-}
-
-func (m *mockUsers) SetTier(ctx context.Context, id int64, tier string, until *time.Time) error {
-	return m.Called(ctx, id, tier, until).Error(0)
 }
 
 // mockSettings stubs SettingsWriter.
@@ -142,13 +138,10 @@ func TestGrantPro_DelegatesToRepo(t *testing.T) {
 	mu.AssertExpectations(t)
 }
 
-func TestDowngradeExpired_DowngradesEach(t *testing.T) {
+func TestDowngradeExpired_ReturnsCountFromRepo(t *testing.T) {
 	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
 	mu := &mockUsers{}
-	mu.On("ListExpired", mock.Anything, now).Return([]int64{1, 2, 3}, nil)
-	mu.On("SetTier", mock.Anything, int64(1), "free", (*time.Time)(nil)).Return(nil)
-	mu.On("SetTier", mock.Anything, int64(2), "free", (*time.Time)(nil)).Return(nil)
-	mu.On("SetTier", mock.Anything, int64(3), "free", (*time.Time)(nil)).Return(nil)
+	mu.On("BulkDowngradeExpired", mock.Anything, now).Return([]int64{1, 2, 3}, nil)
 
 	s := NewService(Deps{
 		Users: mu, Settings: &mockSettings{},
@@ -160,28 +153,10 @@ func TestDowngradeExpired_DowngradesEach(t *testing.T) {
 	mu.AssertExpectations(t)
 }
 
-func TestDowngradeExpired_ContinuesOnIndividualFailure(t *testing.T) {
-	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+func TestDowngradeExpired_RepoError_Surfaces(t *testing.T) {
 	mu := &mockUsers{}
-	mu.On("ListExpired", mock.Anything, now).Return([]int64{1, 2, 3}, nil)
-	mu.On("SetTier", mock.Anything, int64(1), "free", (*time.Time)(nil)).Return(nil)
-	mu.On("SetTier", mock.Anything, int64(2), "free", (*time.Time)(nil)).
-		Return(errors.New("db blip"))
-	mu.On("SetTier", mock.Anything, int64(3), "free", (*time.Time)(nil)).Return(nil)
-
-	s := NewService(Deps{
-		Users: mu, Settings: &mockSettings{},
-		Now: func() time.Time { return now },
-	})
-	n, err := s.DowngradeExpired(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 2, n, "ids 1 and 3 succeed, 2 fails silently")
-	mu.AssertExpectations(t)
-}
-
-func TestDowngradeExpired_ListError_Surfaces(t *testing.T) {
-	mu := &mockUsers{}
-	mu.On("ListExpired", mock.Anything, mock.Anything).Return([]int64(nil), errors.New("pg down"))
+	mu.On("BulkDowngradeExpired", mock.Anything, mock.Anything).
+		Return([]int64(nil), errors.New("pg down"))
 
 	s := NewService(Deps{Users: mu, Settings: &mockSettings{}})
 	n, err := s.DowngradeExpired(context.Background())
