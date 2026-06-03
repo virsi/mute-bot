@@ -15,11 +15,13 @@ type SubsRepo interface {
 	Insert(ctx context.Context, in postgres.SubscriptionInsert) (int64, bool, error)
 }
 
-// Users resolves Telegram users to internal ids and grants Pro time.
-// Implemented by *users.Service in production; mocked in unit tests.
+// Users resolves Telegram users to internal ids, grants Pro time, and
+// reports whether the user is currently Pro. Implemented by *users.Service
+// in production; mocked in unit tests.
 type Users interface {
 	RegisterOnStart(ctx context.Context, tgUserID int64, username string) (postgres.User, bool, error)
 	GrantPro(ctx context.Context, id int64, dur time.Duration) error
+	IsPro(u postgres.User) bool
 }
 
 // Service is the bot-api-side façade over Provider + SubsRepo + Users.
@@ -111,12 +113,24 @@ func (s *Service) Settle(ctx context.Context, raw []byte) (bool, error) {
 		return false, fmt.Errorf("insert subscription: %w", err)
 	}
 	if !isNew {
-		s.logger.InfoContext(ctx, "billing: duplicate webhook, skipping grant",
+		// Duplicate (provider, provider_ref) — the row already exists from
+		// an earlier webhook. Usually a no-op, but if the previous attempt
+		// inserted the row and then failed before GrantPro returned, the
+		// user is still on the free tier despite having paid. Detect that
+		// case by re-checking the tier and catching up.
+		if s.users.IsPro(u) {
+			s.logger.InfoContext(ctx, "billing: duplicate webhook, skipping grant",
+				slog.String("provider", s.provider.Name()),
+				slog.String("provider_ref", a.ProviderRef),
+				slog.Int64("user_id", u.ID),
+			)
+			return false, nil
+		}
+		s.logger.WarnContext(ctx, "billing: subscription row present but user not Pro, granting catch-up",
 			slog.String("provider", s.provider.Name()),
 			slog.String("provider_ref", a.ProviderRef),
 			slog.Int64("user_id", u.ID),
 		)
-		return false, nil
 	}
 	if err := s.users.GrantPro(ctx, u.ID, a.Duration); err != nil {
 		return false, fmt.Errorf("grant pro: %w", err)

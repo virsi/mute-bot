@@ -73,6 +73,10 @@ type fakeUsers struct {
 	registerCalls   int
 	lastGrantUserID int64
 	lastGrantDur    time.Duration
+	// isPro reports whether the resolved user is currently Pro.
+	// Defaults to true after the first GrantPro call so the duplicate-
+	// webhook tests model the post-grant world correctly.
+	isPro bool
 }
 
 func (f *fakeUsers) RegisterOnStart(_ context.Context, tg int64, _ string) (postgres.User, bool, error) {
@@ -91,7 +95,16 @@ func (f *fakeUsers) GrantPro(_ context.Context, id int64, dur time.Duration) err
 	f.grantCalls++
 	f.lastGrantUserID = id
 	f.lastGrantDur = dur
+	if f.grantErr == nil {
+		f.isPro = true
+	}
 	return f.grantErr
+}
+
+func (f *fakeUsers) IsPro(_ postgres.User) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.isPro
 }
 
 func newService(t *testing.T, p Provider, s SubsRepo, u Users) *Service {
@@ -156,6 +169,29 @@ func TestService_Settle_DuplicateWebhook_NoSecondGrant(t *testing.T) {
 	require.Equal(t, 1, users.grantCalls, "exactly one Pro grant despite two webhooks")
 	require.Equal(t, 2, subs.calls, "Insert called twice — repo handles dedup, not service")
 	require.Len(t, subs.byRef, 1, "exactly one row persisted")
+}
+
+// TestService_Settle_DuplicateWebhook_CatchUp models the failure window
+// where the first webhook persisted the subscription row but GrantPro
+// errored. On the next retry the Insert returns isNew=false yet IsPro is
+// still false — Settle must catch up by issuing GrantPro instead of
+// silently skipping it.
+func TestService_Settle_DuplicateWebhook_CatchUp(t *testing.T) {
+	p := &stubProvider{name: "tg_stars", act: Activation{
+		UserID: 42, ProviderRef: "ref-catchup", Plan: PlanPro30d, Duration: Duration30d,
+	}}
+	subs := newFakeSubs()
+	users := &fakeUsers{} // isPro stays false until a successful GrantPro
+	// Pre-seed the subs store so the first call returns isNew=false.
+	subs.byRef["tg_stars:ref-catchup"] = 7
+	subs.nextID = 7
+	svc := newService(t, p, subs, users)
+
+	granted, err := svc.Settle(context.Background(), []byte("{}"))
+	require.NoError(t, err)
+	require.True(t, granted, "catch-up must still report granted=true")
+	require.Equal(t, 1, users.grantCalls, "GrantPro fires once on catch-up")
+	require.True(t, users.isPro)
 }
 
 func TestService_Settle_HandlePaymentError_NoSideEffects(t *testing.T) {
