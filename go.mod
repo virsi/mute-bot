@@ -3,6 +3,7 @@ module github.com/virsi/mute-bot
 go 1.26.1
 
 require (
+	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/go-co-op/gocron/v2 v2.21.2
 	github.com/go-telegram/bot v1.21.0
 	github.com/gotd/td v0.145.1
@@ -21,7 +22,6 @@ require (
 )
 
 require (
-	github.com/PuerkitoBio/goquery v1.12.0 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect

@@ -53,9 +53,9 @@ func (r *SettingsRepo) Upsert(ctx context.Context, userID int64, in SettingsUpda
 		ON CONFLICT (user_id) DO UPDATE
 		   SET topics = EXCLUDED.topics,
 		       threshold = EXCLUDED.threshold,
-		       digest_schedule = EXCLUDED.digest_schedule,
+		       digest_schedule = COALESCE(EXCLUDED.digest_schedule, user_settings.digest_schedule),
 		       alerts_enabled = EXCLUDED.alerts_enabled,
-		       alert_threshold = EXCLUDED.alert_threshold,
+		       alert_threshold = COALESCE(NULLIF(EXCLUDED.alert_threshold, 0), user_settings.alert_threshold),
 		       weekly_enabled = EXCLUDED.weekly_enabled,
 		       updated_at = now()`
 	if _, err := r.p.Pool().Exec(ctx, q,
