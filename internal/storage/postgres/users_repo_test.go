@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -40,6 +41,93 @@ func TestUsersRepo_GetOrCreate(t *testing.T) {
 	u3, _, err := r.GetOrCreate(ctx, 555, "virsi_changed")
 	require.NoError(t, err)
 	require.True(t, u3.Blocked)
+}
+
+func TestUsersRepo_GrantPro_NewSetsUntil(t *testing.T) {
+	p := setupTestPool(t)
+	truncate(t, p, "users")
+	ctx := context.Background()
+	r := NewUsersRepo(p)
+	u, _, err := r.GetOrCreate(ctx, 1111, "u")
+	require.NoError(t, err)
+
+	require.NoError(t, r.GrantPro(ctx, u.ID, 30*24*time.Hour))
+
+	u2, _, err := r.GetOrCreate(ctx, 1111, "u")
+	require.NoError(t, err)
+	require.Equal(t, "pro", u2.Tier)
+	require.NotNil(t, u2.TierUntil)
+	require.True(t, u2.TierUntil.After(time.Now().Add(29*24*time.Hour)))
+}
+
+func TestUsersRepo_GrantPro_Extends(t *testing.T) {
+	p := setupTestPool(t)
+	truncate(t, p, "users")
+	ctx := context.Background()
+	r := NewUsersRepo(p)
+	u, _, err := r.GetOrCreate(ctx, 2222, "u")
+	require.NoError(t, err)
+
+	require.NoError(t, r.GrantPro(ctx, u.ID, 30*24*time.Hour))
+	u2, _, err := r.GetOrCreate(ctx, 2222, "u")
+	require.NoError(t, err)
+	require.NotNil(t, u2.TierUntil)
+	first := *u2.TierUntil
+
+	require.NoError(t, r.GrantPro(ctx, u.ID, 30*24*time.Hour))
+	u3, _, err := r.GetOrCreate(ctx, 2222, "u")
+	require.NoError(t, err)
+	require.NotNil(t, u3.TierUntil)
+	// Second grant adds another 30 days on top of the first deadline.
+	require.True(t, u3.TierUntil.After(first.Add(29*24*time.Hour)),
+		"second grant must extend, got first=%v second=%v", first, *u3.TierUntil)
+}
+
+func TestUsersRepo_ListExpired(t *testing.T) {
+	p := setupTestPool(t)
+	truncate(t, p, "users")
+	ctx := context.Background()
+	r := NewUsersRepo(p)
+
+	u1, _, err := r.GetOrCreate(ctx, 3333, "u")
+	require.NoError(t, err)
+	_, err = p.Pool().Exec(ctx,
+		`UPDATE users SET tier='pro', tier_until=now()-interval '1 hour' WHERE id=$1`, u1.ID)
+	require.NoError(t, err)
+
+	u2, _, err := r.GetOrCreate(ctx, 3334, "v")
+	require.NoError(t, err)
+	_, err = p.Pool().Exec(ctx,
+		`UPDATE users SET tier='pro', tier_until=now()+interval '1 hour' WHERE id=$1`, u2.ID)
+	require.NoError(t, err)
+
+	// Free user must not show up regardless of tier_until.
+	u3, _, err := r.GetOrCreate(ctx, 3335, "w")
+	require.NoError(t, err)
+	_, err = p.Pool().Exec(ctx,
+		`UPDATE users SET tier_until=now()-interval '1 hour' WHERE id=$1`, u3.ID)
+	require.NoError(t, err)
+
+	ids, err := r.ListExpired(ctx, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, []int64{u1.ID}, ids)
+}
+
+func TestUsersRepo_SetTier(t *testing.T) {
+	p := setupTestPool(t)
+	truncate(t, p, "users")
+	ctx := context.Background()
+	r := NewUsersRepo(p)
+	u, _, err := r.GetOrCreate(ctx, 4444, "u")
+	require.NoError(t, err)
+	require.NoError(t, r.GrantPro(ctx, u.ID, 24*time.Hour))
+
+	require.NoError(t, r.SetTier(ctx, u.ID, "free", nil))
+
+	u2, _, err := r.GetOrCreate(ctx, 4444, "u")
+	require.NoError(t, err)
+	require.Equal(t, "free", u2.Tier)
+	require.Nil(t, u2.TierUntil)
 }
 
 func TestSettingsRepo_UpsertGet(t *testing.T) {
