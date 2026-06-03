@@ -20,6 +20,7 @@ import (
 	tgbot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 
+	"github.com/virsi/mute-bot/internal/billing"
 	"github.com/virsi/mute-bot/internal/bot"
 	"github.com/virsi/mute-bot/internal/config"
 	"github.com/virsi/mute-bot/internal/digest"
@@ -93,12 +94,28 @@ func run() error {
 	clusters := postgres.NewClustersRepo(pool)
 	deliveries := postgres.NewDeliveriesRepo(pool)
 	channelsRepo := postgres.NewChannelsRepo(pool)
+	subsRepo := postgres.NewSubscriptionsRepo(pool)
 
 	// usersSvc unifies /start, billing webhooks (M3) and the expiry sweep
 	// behind one service so the upsert + default-seed flow stays in one
 	// place. It also doubles as the TierChecker for /settings and the
 	// Pro-gate middleware below.
 	usersSvc := users.NewService(users.Deps{Users: usersRepo, Settings: settings})
+
+	// Billing wiring: StarsProvider over the live Bot API + Service over
+	// (provider, subsRepo, usersSvc). Service.Settle is the idempotent
+	// activation entry point invoked by the payment_handlers below.
+	starsProvider := billing.NewStarsProvider(client.Bot())
+	billingSvc := billing.NewService(billing.Deps{
+		Provider: starsProvider,
+		Subs:     subsRepo,
+		Users:    usersSvc,
+	})
+	paymentHandlers := bot.NewPaymentHandlers(bot.PaymentHandlersDeps{
+		Acker:   client.Bot(),
+		Settler: billingSvc,
+		API:     &client.SendOnly,
+	})
 
 	assembler := digest.NewAssembler(digest.AssemblerDeps{
 		Settings:   settings,
@@ -126,9 +143,12 @@ func run() error {
 		API:       &client.SendOnly,
 		Registrar: usersSvc,
 		Tier:      usersSvc,
+		Invoicer:  billingSvc,
+		ButtonAPI: &client.SendOnly,
 	})
 
 	registerHandlers(client.Bot(), h, usersSvc, &client.SendOnly)
+	registerPaymentHandlers(client.Bot(), paymentHandlers)
 
 	slog.Info("bot-api: starting long poll")
 	client.Bot().Start(rootCtx)
@@ -246,8 +266,8 @@ func registerHandlers(b *tgbot.Bot, h *bot.Handlers, reg bot.Registrar, sender b
 		},
 	)
 	// /buy is intentionally NOT gated — Free users must reach the upgrade
-	// flow. M2 ships a stub message; M3 replaces the body with a real
-	// sendInvoice via the billing.Provider abstraction.
+	// flow. M3 wires the Stars invoice via billing.Service; the handler
+	// renders an inline-keyboard button that opens the t.me/$… deeplink.
 	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/buy", tgbot.MatchTypePrefix,
 		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
 			if u.Message == nil || u.Message.From == nil {
@@ -256,6 +276,29 @@ func registerHandlers(b *tgbot.Bot, h *bot.Handlers, reg bot.Registrar, sender b
 			if err := h.HandleBuy(ctx, u.Message.From.ID, u.Message.From.Username); err != nil {
 				slog.Error("/buy failed", slog.Any("err", err))
 			}
+		},
+	)
+}
+
+// registerPaymentHandlers attaches the two payment-update routes the bot
+// needs once billing is live: pre_checkout_query (we always ACK ok=true)
+// and successful_payment (which carries the data billing.Service.Settle
+// turns into a Pro grant). The go-telegram/bot library does not provide a
+// dedicated update-type constant for these, so we route via the generic
+// MatchFunc surface.
+func registerPaymentHandlers(b *tgbot.Bot, ph *bot.PaymentHandlers) {
+	b.RegisterHandlerMatchFunc(
+		func(u *models.Update) bool { return u != nil && u.PreCheckoutQuery != nil },
+		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
+			ph.HandlePreCheckout(ctx, u)
+		},
+	)
+	b.RegisterHandlerMatchFunc(
+		func(u *models.Update) bool {
+			return u != nil && u.Message != nil && u.Message.SuccessfulPayment != nil
+		},
+		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
+			ph.HandleSuccessfulPayment(ctx, u)
 		},
 	)
 }

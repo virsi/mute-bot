@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -328,13 +329,84 @@ func TestHandleSettings_ShowsTierProWithUntil(t *testing.T) {
 	require.Contains(t, send.msgs[0], "15 Jul 2026")
 }
 
-func TestHandleBuy_SendsStubReply(t *testing.T) {
+func TestHandleBuy_NoInvoicerFallsBackToStub(t *testing.T) {
 	send := &capturedSender{}
 	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send})
 
 	require.NoError(t, h.HandleBuy(context.Background(), 555, "alice"))
 	require.Len(t, send.msgs, 1)
 	require.Contains(t, send.msgs[0], "Stars")
+}
+
+// fakeInvoicer stubs the billing.Service surface used by /buy.
+type fakeInvoicer struct {
+	url      string
+	err      error
+	calls    int
+	lastUser int64
+	lastPlan string
+}
+
+func (f *fakeInvoicer) CreateInvoice(_ context.Context, tg int64, plan string) (string, error) {
+	f.calls++
+	f.lastUser = tg
+	f.lastPlan = plan
+	return f.url, f.err
+}
+
+// fakeButtonAPI captures SendURLButton invocations.
+type fakeButtonAPI struct {
+	calls       int
+	lastText    string
+	lastButton  string
+	lastURL     string
+	lastChatID  int64
+	returnError error
+}
+
+func (f *fakeButtonAPI) SendURLButton(_ context.Context, chatID int64, text, btn, url string) error {
+	f.calls++
+	f.lastChatID = chatID
+	f.lastText = text
+	f.lastButton = btn
+	f.lastURL = url
+	return f.returnError
+}
+
+func TestHandleBuy_WithInvoicer_SendsURLButton(t *testing.T) {
+	send := &capturedSender{}
+	inv := &fakeInvoicer{url: "https://t.me/$abcdef"}
+	btn := &fakeButtonAPI{}
+	reg := &fakeRegistrarRecorder{}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{},
+		API: send, Invoicer: inv, ButtonAPI: btn, Registrar: reg,
+	})
+
+	require.NoError(t, h.HandleBuy(context.Background(), 555, "alice"))
+	require.True(t, reg.called, "user must be registered before paying")
+	require.Equal(t, 1, inv.calls)
+	require.Equal(t, int64(555), inv.lastUser)
+	require.Equal(t, "pro_30d", inv.lastPlan)
+	require.Equal(t, 1, btn.calls)
+	require.Equal(t, int64(555), btn.lastChatID)
+	require.Equal(t, "https://t.me/$abcdef", btn.lastURL)
+	require.Contains(t, btn.lastButton, "99")
+	require.Empty(t, send.msgs, "no plain Send when the button path runs")
+}
+
+func TestHandleBuy_InvoiceError_PropagatesAndNoButtonSent(t *testing.T) {
+	send := &capturedSender{}
+	inv := &fakeInvoicer{err: errors.New("upstream 5xx")}
+	btn := &fakeButtonAPI{}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{},
+		API: send, Invoicer: inv, ButtonAPI: btn, Registrar: &fakeRegistrarRecorder{},
+	})
+
+	err := h.HandleBuy(context.Background(), 555, "alice")
+	require.Error(t, err)
+	require.Equal(t, 0, btn.calls)
 }
 
 func TestAssemblerFunc_AdaptsFunc(t *testing.T) {
