@@ -4,11 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/virsi/mute-bot/internal/storage/postgres"
 )
+
+// fakeRegistrarRecorder stubs the Registrar port for HandleStart tests
+// that need to verify the service was called and capture the args.
+type fakeRegistrarRecorder struct {
+	called   bool
+	tgUserID int64
+	username string
+	created  bool
+	err      error
+}
+
+func (f *fakeRegistrarRecorder) RegisterOnStart(_ context.Context, tg int64, u string) (postgres.User, bool, error) {
+	f.called = true
+	f.tgUserID, f.username = tg, u
+	return postgres.User{ID: 1, TGUserID: tg, Username: u, Tier: "free"}, f.created, f.err
+}
 
 // fakeUsers stubs UsersRepo. GetOrCreate always returns the same user row;
 // the created flag is parameterised so individual tests can simulate either
@@ -245,6 +262,79 @@ func TestSchedule_PersistsForSchedulerReload(t *testing.T) {
 	require.NoError(t, json.Unmarshal(reloaded.ScheduleJSON, &got))
 	require.Equal(t, []string{"07:00", "18:30"}, got.Times)
 	require.Equal(t, "Europe/Moscow", got.TZ)
+}
+
+func TestHandleStart_WithRegistrar_DelegatesAndSendsWelcome(t *testing.T) {
+	send := &capturedSender{}
+	reg := &fakeRegistrarRecorder{created: true}
+	h := NewHandlers(HandlersDeps{
+		Users:     &fakeUsers{}, // unused when Registrar wired
+		Settings:  &fakeSettings{},
+		API:       send,
+		Registrar: reg,
+	})
+	require.NoError(t, h.HandleStart(context.Background(), 555, "alice"))
+	require.True(t, reg.called)
+	require.Equal(t, int64(555), reg.tgUserID)
+	require.Equal(t, "alice", reg.username)
+	require.Len(t, send.msgs, 1)
+}
+
+func TestHandleSettings_ShowsTierFree(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{
+		Topics:       []string{"politics"},
+		Threshold:    50,
+		ScheduleJSON: json.RawMessage(`{}`),
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleSettings(context.Background(), 555, "alice"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "Тариф: free")
+	require.NotContains(t, send.msgs[0], "(до ")
+}
+
+// fakeUsersWithTier returns a Pro user with the configured TierUntil so
+// HandleSettings can render the deadline line.
+type fakeUsersWithTier struct {
+	tier  string
+	until *time.Time
+}
+
+func (f *fakeUsersWithTier) GetOrCreate(_ context.Context, tg int64, username string) (postgres.User, bool, error) {
+	return postgres.User{
+		ID: 1, TGUserID: tg, Username: username,
+		Tier: f.tier, TierUntil: f.until,
+	}, false, nil
+}
+
+func TestHandleSettings_ShowsTierProWithUntil(t *testing.T) {
+	until := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{
+		Topics:       []string{"politics"},
+		Threshold:    50,
+		ScheduleJSON: json.RawMessage(`{}`),
+	}}
+	h := NewHandlers(HandlersDeps{
+		Users:    &fakeUsersWithTier{tier: "pro", until: &until},
+		Settings: st, API: send,
+	})
+
+	require.NoError(t, h.HandleSettings(context.Background(), 555, "alice"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "Тариф: pro")
+	require.Contains(t, send.msgs[0], "15 Jul 2026")
+}
+
+func TestHandleBuy_SendsStubReply(t *testing.T) {
+	send := &capturedSender{}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send})
+
+	require.NoError(t, h.HandleBuy(context.Background(), 555, "alice"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "Stars")
 }
 
 func TestAssemblerFunc_AdaptsFunc(t *testing.T) {
