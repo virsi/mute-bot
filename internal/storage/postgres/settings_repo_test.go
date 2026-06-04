@@ -33,7 +33,8 @@ func TestSettingsRepo_Defaults(t *testing.T) {
 	require.Equal(t, []string{"politics"}, s.Topics)
 	require.Equal(t, 70, s.Threshold)
 	require.False(t, s.AlertsEnabled)
-	require.Equal(t, 85, s.AlertThreshold) // default from migration 0001
+	require.Equal(t, 85, s.AlertThreshold)  // default from migration 0001
+	require.Equal(t, 30, s.AlertThrottleMin) // default from migration 0005
 }
 
 func TestSettingsRepo_UpsertReplaces(t *testing.T) {
@@ -51,10 +52,11 @@ func TestSettingsRepo_UpsertReplaces(t *testing.T) {
 		Threshold: 40,
 	}))
 	require.NoError(t, sr.Upsert(ctx, u.ID, SettingsUpdate{
-		Topics:         []string{"crypto"},
-		Threshold:      60,
-		AlertsEnabled:  true,
-		AlertThreshold: 92,
+		Topics:           []string{"crypto"},
+		Threshold:        60,
+		AlertsEnabled:    true,
+		AlertThreshold:   92,
+		AlertThrottleMin: 15,
 	}))
 
 	s, err := sr.Get(ctx, u.ID)
@@ -63,4 +65,5 @@ func TestSettingsRepo_UpsertReplaces(t *testing.T) {
 	require.Equal(t, 60, s.Threshold)
 	require.True(t, s.AlertsEnabled)
 	require.Equal(t, 92, s.AlertThreshold)
+	require.Equal(t, 15, s.AlertThrottleMin)
 }
