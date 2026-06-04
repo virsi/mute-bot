@@ -23,6 +23,17 @@ func setupTestRedis(t *testing.T) (*Client, func()) {
 	require.NoError(t, err)
 	// Wipe leftover dedup:borderline list so tests don't see each other.
 	require.NoError(t, c.RDB().Del(ctx, "dedup:borderline").Err())
+	// Same for alert_throttle:* keys — SCAN+DEL keeps the helper safe even
+	// when concurrent tests leave throttle entries behind.
+	iter := c.RDB().Scan(ctx, 0, "alert_throttle:*", 0).Iterator()
+	var keys []string
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	require.NoError(t, iter.Err())
+	if len(keys) > 0 {
+		require.NoError(t, c.RDB().Del(ctx, keys...).Err())
+	}
 	return c, func() { _ = c.Close() }
 }
 
