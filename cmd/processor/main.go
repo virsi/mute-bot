@@ -130,6 +130,7 @@ func run() error {
 		Cache: embCache,
 		Model: cfg.LLM.EmbeddingModel,
 	})
+	borderlineQueue := rdb.NewBorderlineQueue(rclient, 5000)
 	matcher := dedup.NewMatcher(dedup.MatcherDeps{
 		MinHashIndex: minhashIdx,
 		Embedder:     embedder,
@@ -138,6 +139,7 @@ func run() error {
 		Posts:        postsRepo,
 		Publisher:    pub,
 		Model:        cfg.LLM.EmbeddingModel,
+		Borderline:   borderlineQueue,
 	})
 	dedupWorker := dedup.NewWorker(dedup.WorkerDeps{Matcher: matcher})
 
@@ -218,6 +220,23 @@ func run() error {
 	go func() {
 		defer wg.Done()
 		classifyWorker.Run(rootCtx)
+	}()
+
+	// Borderline reconciler: drains the dedup:borderline list every 5
+	// minutes, asks LLMJudge per pair, and merges clusters that the model
+	// rules same-event with high confidence. Runs out of band so a slow LLM
+	// never blocks the dedup hot path.
+	judge := dedup.NewLLMJudge(dedup.LLMJudgeDeps{LLM: llmClient, Model: cfg.LLM.ClassifierModel})
+	reconciler := dedup.NewReconciler(dedup.ReconcilerDeps{
+		Queue:    borderlineQueue,
+		Posts:    postsRepo,
+		Clusters: clustersRepo,
+		Judge:    judge,
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = reconciler.Run(rootCtx)
 	}()
 
 	// consume launches a JetStream consumer goroutine and tracks it on wg

@@ -9,6 +9,7 @@ import (
 
 	"github.com/virsi/mute-bot/internal/queue"
 	"github.com/virsi/mute-bot/internal/storage/postgres"
+	redisstore "github.com/virsi/mute-bot/internal/storage/redis"
 )
 
 // MHIndex is the slice of the MinHash LSH index this orchestrator depends
@@ -52,6 +53,14 @@ type Publisher interface {
 	Publish(ctx context.Context, subject string, payload any) error
 }
 
+// BorderlinePusher receives (post_id, candidate_id, distance) tuples when
+// the nearest neighbor's cosine distance falls between MaxDistance and
+// MaxDistance + BorderlineWidth. The reconciler goroutine drains these and
+// asks LLMJudge to decide whether the pair should be merged retroactively.
+type BorderlinePusher interface {
+	Push(ctx context.Context, p redisstore.BorderlinePair) error
+}
+
 // MatcherDeps groups the Matcher's collaborators.
 type MatcherDeps struct {
 	MinHash      *MinHash
@@ -67,6 +76,13 @@ type MatcherDeps struct {
 	// MaxDistance is the cosine-distance threshold below which an existing
 	// post is accepted as the same event (0.15 ≈ similarity 0.85).
 	MaxDistance float32
+	// BorderlineWidth is the band above MaxDistance that counts as
+	// borderline. Default 0.10, so [0.15, 0.25] with default MaxDistance.
+	BorderlineWidth float32
+	// Borderline is an optional queue that receives (post_id, candidate_id,
+	// distance) tuples for pairs in the borderline band. Nil disables the
+	// signal — the matcher still works, just without LLMJudge wake-ups.
+	Borderline BorderlinePusher
 }
 
 // Matcher orchestrates the dedup decision for a single normalized post:
@@ -95,6 +111,9 @@ func NewMatcher(d MatcherDeps) *Matcher {
 	}
 	if d.MaxDistance == 0 {
 		d.MaxDistance = 0.15
+	}
+	if d.BorderlineWidth == 0 {
+		d.BorderlineWidth = 0.10
 	}
 	if d.Model == "" {
 		d.Model = "text-embedding-3-small"
@@ -134,16 +153,45 @@ func (m *Matcher) Match(ctx context.Context, in MatchInput) error {
 		return fmt.Errorf("store embedding: %w", err)
 	}
 
+	// Widen the kNN bound to MaxDistance + BorderlineWidth so we can
+	// inspect close-but-not-close-enough neighbors. The dedup decision
+	// still uses MaxDistance; anything between the two thresholds is
+	// classified as borderline and forwarded to the reconciler.
 	near, err := m.d.Embeddings.NearestNeighbors(ctx, pv, postgres.NearestParams{
 		Limit:             m.d.NearLimit,
-		MaxCosineDistance: m.d.MaxDistance,
+		MaxCosineDistance: m.d.MaxDistance + m.d.BorderlineWidth,
 	})
 	if err != nil {
 		return fmt.Errorf("nearest neighbors: %w", err)
 	}
+
+	// Borderline detection: the nearest neighbor sits above MaxDistance but
+	// inside the BorderlineWidth band. Push the pair so the reconciler can
+	// ask LLMJudge whether the two posts are about the same event.
+	if m.d.Borderline != nil {
+		for _, n := range near {
+			if n.PostID == in.PostID {
+				continue
+			}
+			if n.Distance > m.d.MaxDistance && n.Distance <= m.d.MaxDistance+m.d.BorderlineWidth {
+				_ = m.d.Borderline.Push(ctx, redisstore.BorderlinePair{
+					PostID:      in.PostID,
+					CandidateID: n.PostID,
+					Distance:    n.Distance,
+				})
+			}
+			break
+		}
+	}
+
 	neighborIDs := make([]int64, 0, len(near))
 	for _, n := range near {
 		if n.PostID == in.PostID {
+			continue
+		}
+		// Hard cut at MaxDistance — neighbors above the cap are borderline
+		// (handled above) but must not auto-merge.
+		if n.Distance > m.d.MaxDistance {
 			continue
 		}
 		neighborIDs = append(neighborIDs, n.PostID)
