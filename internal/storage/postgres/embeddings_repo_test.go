@@ -55,6 +55,56 @@ func TestEmbeddingsRepo_StoreAndUpsert(t *testing.T) {
 	require.Equal(t, "test-v2", model)
 }
 
+// TestEmbeddingsRepo_ClusterCentroid covers the AVG-over-cluster path
+// used by the digest custom-topic filter. Two posts inside the same
+// cluster, with vectors (0.1) and (0.3), should average to (0.2) in
+// every dimension. A cluster with no posts at all surfaces
+// ErrNoEmbeddings so the assembler can skip the topic check.
+func TestEmbeddingsRepo_ClusterCentroid(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_DSN unset")
+	}
+	ctx := context.Background()
+	p, err := NewPool(ctx, dsn)
+	require.NoError(t, err)
+	defer p.Close()
+	_, err = p.Pool().Exec(ctx,
+		"TRUNCATE post_embeddings, posts, clusters, channels RESTART IDENTITY CASCADE")
+	require.NoError(t, err)
+
+	ch := NewChannelsRepo(p)
+	chID, err := ch.Upsert(ctx, ChannelInsert{TGChannelID: 1, Username: "x", Title: "X", Authority: 50})
+	require.NoError(t, err)
+	cr := NewClustersRepo(p)
+	pr := NewPostsRepo(p)
+	e := NewEmbeddingsRepo(p)
+
+	cid, err := cr.Create(ctx)
+	require.NoError(t, err)
+
+	id1, err := pr.Insert(ctx, PostInsert{ChannelID: chID, TGMsgID: 1, TextClean: "a", TextHash: []byte("h1"), PostedAt: time.Now().UTC()})
+	require.NoError(t, err)
+	id2, err := pr.Insert(ctx, PostInsert{ChannelID: chID, TGMsgID: 2, TextClean: "b", TextHash: []byte("h2"), PostedAt: time.Now().UTC()})
+	require.NoError(t, err)
+	require.NoError(t, pr.AttachCluster(ctx, id1, cid))
+	require.NoError(t, pr.AttachCluster(ctx, id2, cid))
+
+	require.NoError(t, e.Store(ctx, id1, pgvector.NewVector(fillVec(1536, 0.1)), "test"))
+	require.NoError(t, e.Store(ctx, id2, pgvector.NewVector(fillVec(1536, 0.3)), "test"))
+
+	v, err := e.ClusterCentroid(ctx, cid)
+	require.NoError(t, err)
+	require.Len(t, v.Slice(), 1536)
+	require.InDelta(t, 0.2, v.Slice()[0], 1e-5)
+
+	// Cluster without posts must surface ErrNoEmbeddings, not a zero vector.
+	emptyCID, err := cr.Create(ctx)
+	require.NoError(t, err)
+	_, err = e.ClusterCentroid(ctx, emptyCID)
+	require.ErrorIs(t, err, ErrNoEmbeddings)
+}
+
 func TestEmbeddingsRepo_NearestNeighbors(t *testing.T) {
 	dsn := os.Getenv("POSTGRES_DSN")
 	if dsn == "" {

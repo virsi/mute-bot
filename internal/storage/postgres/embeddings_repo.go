@@ -2,10 +2,20 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
 )
+
+// ErrNoEmbeddings signals that ClusterCentroid was asked about a cluster
+// that has no posts with embeddings yet (typical for very fresh clusters
+// where the dedup pipeline has not produced embeddings before classify
+// fires). The digest filter treats this as "skip the topic check for this
+// cluster" so the cluster falls through with the assembler's default
+// behavior.
+var ErrNoEmbeddings = errors.New("cluster has no embeddings yet")
 
 // EmbeddingsRepo stores per-post embeddings and runs kNN queries against
 // pgvector to find similar recent posts (dedup candidate generation).
@@ -41,6 +51,36 @@ func (r *EmbeddingsRepo) Store(ctx context.Context, postID int64, v pgvector.Vec
 		return fmt.Errorf("store embedding: %w", err)
 	}
 	return nil
+}
+
+// ClusterCentroid returns the average embedding across every post in
+// clusterID. Used by the digest custom-topic filter as the per-cluster
+// "topic vector" against which user topic embeddings are compared via
+// pgvector cosine distance.
+//
+// Returns ErrNoEmbeddings when the cluster has no posts or none of them
+// have embeddings yet — the caller (assembler) skips the filter for
+// that cluster rather than dropping it silently.
+func (r *EmbeddingsRepo) ClusterCentroid(ctx context.Context, clusterID int64) (pgvector.Vector, error) {
+	// AVG always returns exactly one row — NULL when there are no
+	// matching post_embeddings. Scanning into *pgvector.Vector lets
+	// pgx put NULL into a nil pointer rather than erroring out.
+	const q = `
+		SELECT AVG(e.embedding)::vector(1536)
+		  FROM post_embeddings e
+		  JOIN posts p ON p.id = e.post_id
+		 WHERE p.cluster_id = $1`
+	var v *pgvector.Vector
+	if err := r.p.Pool().QueryRow(ctx, q, clusterID).Scan(&v); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return pgvector.Vector{}, ErrNoEmbeddings
+		}
+		return pgvector.Vector{}, fmt.Errorf("centroid: %w", err)
+	}
+	if v == nil || len(v.Slice()) == 0 {
+		return pgvector.Vector{}, ErrNoEmbeddings
+	}
+	return *v, nil
 }
 
 // NearestNeighbors returns posts with cosine distance to v at most
