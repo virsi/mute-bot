@@ -172,12 +172,14 @@ func run() error {
 	// Two processes hold the token simultaneously — for Phase 1 this is
 	// acceptable because the bot-api process only does long-poll on the
 	// updates endpoint and the processor only calls SendMessage; they do
-	// not contend on a single API resource.
-	api, err := bot.NewBotAPI(cfg.BotToken)
+	// not contend on a single API resource. SendOnly intentionally hides
+	// the long-polling surface so the processor cannot accidentally call
+	// getUpdates and contend with cmd/bot-api.
+	sendOnly, err := bot.NewSendOnly(cfg.BotToken)
 	if err != nil {
-		return fmt.Errorf("new bot api: %w", err)
+		return fmt.Errorf("new bot sender: %w", err)
 	}
-	sender := bot.NewSender(bot.SenderDeps{API: api, PerChatPerSec: 1})
+	sender := bot.NewSender(bot.SenderDeps{API: sendOnly, PerChatPerSec: 1})
 
 	assembler := digest.NewAssembler(digest.AssemblerDeps{
 		Settings:   settingsRepo,
