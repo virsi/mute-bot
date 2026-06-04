@@ -120,3 +120,36 @@ func (r *UsersRepo) SetTier(ctx context.Context, id int64, tier string, until *t
 	}
 	return nil
 }
+
+// BulkDowngradeExpired atomically downgrades every Pro user whose
+// tier_until has passed back to free in a single UPDATE. Returns the ids
+// that were actually flipped. Used by the hourly sweeper instead of the
+// list-then-loop pattern so a concurrent GrantPro between the SELECT and
+// UPDATE cannot lose data — the WHERE clause re-evaluates per row.
+func (r *UsersRepo) BulkDowngradeExpired(ctx context.Context, asOf time.Time) ([]int64, error) {
+	const q = `
+		UPDATE users
+		   SET tier = 'free',
+		       tier_until = NULL
+		 WHERE tier = 'pro'
+		   AND tier_until IS NOT NULL
+		   AND tier_until <= $1
+		RETURNING id`
+	rows, err := r.p.Pool().Query(ctx, q, asOf)
+	if err != nil {
+		return nil, fmt.Errorf("bulk downgrade: %w", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan id: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows err: %w", err)
+	}
+	return out, nil
+}

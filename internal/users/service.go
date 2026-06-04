@@ -100,21 +100,13 @@ func (s *Service) GrantPro(ctx context.Context, id int64, dur time.Duration) err
 
 // DowngradeExpired flips every Pro user whose tier_until has passed back
 // to free, clearing tier_until in the same write. Returns the count of
-// users actually downgraded. Per-user failures are logged at WARN and do
-// not stop the sweep — the next tick will retry.
+// users actually downgraded. The repo executes a single UPDATE ... RETURNING
+// id so a concurrent GrantPro cannot lose its work between SELECT and
+// UPDATE.
 func (s *Service) DowngradeExpired(ctx context.Context) (int, error) {
-	ids, err := s.users.ListExpired(ctx, s.now())
+	ids, err := s.users.BulkDowngradeExpired(ctx, s.now())
 	if err != nil {
-		return 0, fmt.Errorf("list expired: %w", err)
+		return 0, fmt.Errorf("bulk downgrade: %w", err)
 	}
-	n := 0
-	for _, id := range ids {
-		if err := s.users.SetTier(ctx, id, "free", nil); err != nil {
-			s.logger.WarnContext(ctx, "downgrade expired",
-				slog.Int64("user_id", id), slog.Any("err", err))
-			continue
-		}
-		n++
-	}
-	return n, nil
+	return len(ids), nil
 }

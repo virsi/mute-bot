@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -106,7 +107,10 @@ func run() error {
 		Settings: postgres.NewSettingsRepo(pool),
 	})
 	sweeper := scheduler.NewExpirySweeper(usersSvc, time.Hour, nil, slog.Default())
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if err := sweeper.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
 			slog.Warn("scheduler: expiry sweeper exited", slog.Any("err", err))
 		}
@@ -117,6 +121,9 @@ func run() error {
 	if err := cron.Stop(); err != nil {
 		slog.Warn("scheduler: stop error", slog.Any("err", err))
 	}
+	// Wait for the sweeper goroutine to exit so an in-flight Postgres
+	// UPDATE finishes before the pool is closed by the deferred Close.
+	wg.Wait()
 	slog.Info("scheduler: stopped")
 	return nil
 }

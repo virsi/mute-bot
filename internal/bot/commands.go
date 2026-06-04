@@ -129,10 +129,13 @@ func (h *Handlers) HandleStart(ctx context.Context, tgUserID int64, username str
 		return fmt.Errorf("get_or_create user: %w", err)
 	}
 	if created {
-		sched, _ := json.Marshal(map[string]any{
+		sched, err := json.Marshal(map[string]any{
 			"times": []string{"08:00", "19:00"},
 			"tz":    "Europe/Moscow",
 		})
+		if err != nil {
+			return fmt.Errorf("marshal default schedule: %w", err)
+		}
 		if err := h.d.Settings.Upsert(ctx, u.ID, postgres.SettingsUpdate{
 			Topics:       []string{"politics", "it"},
 			Threshold:    50,
