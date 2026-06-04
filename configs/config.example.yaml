@@ -4,6 +4,7 @@ nats_url:     "nats://localhost:4222"
 bot_token:    "REPLACE_ME"
 openai_api_key: "REPLACE_ME"
 channels_file: "configs/channels.yaml"
+otlp_endpoint: ""  # e.g. "localhost:4317" for local jaeger; empty = noop
 mtproto:
   api_id: 0
   api_hash: "REPLACE_ME"

@@ -20,6 +20,7 @@ type Config struct {
 	BotToken     string  `yaml:"bot_token"`
 	OpenAIAPIKey string  `yaml:"openai_api_key"`
 	ChannelsFile string  `yaml:"channels_file"`
+	OTLPEndpoint string  `yaml:"otlp_endpoint"`
 	MTProto      MTProto `yaml:"mtproto"`
 	LLM          LLM     `yaml:"llm"`
 }
@@ -96,6 +97,7 @@ func applyEnvOverrides(c *Config) {
 		"MUTE_BOT_TOKEN":       &c.BotToken,
 		"MUTE_OPENAI_API_KEY":  &c.OpenAIAPIKey,
 		"MUTE_OPENAI_BASE_URL": &c.LLM.BaseURL,
+		"MUTE_OTLP_ENDPOINT":   &c.OTLPEndpoint,
 	}
 	for k, p := range overrides {
 		if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
