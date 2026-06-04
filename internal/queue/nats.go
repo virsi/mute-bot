@@ -39,7 +39,16 @@ func Connect(ctx context.Context, url string) (*Conn, error) {
 	}
 	// Ensure the connection is actually reachable before returning. Without
 	// this an unreachable broker only surfaces on first publish/consume.
-	if err := nc.FlushWithContext(ctx); err != nil {
+	// FlushWithContext requires the context to carry a deadline; if the caller
+	// passed a Background-like context, supply a sane default so production
+	// main()s don't have to wrap every call themselves.
+	flushCtx := ctx
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		flushCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+	}
+	if err := nc.FlushWithContext(flushCtx); err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("nats flush: %w", err)
 	}
