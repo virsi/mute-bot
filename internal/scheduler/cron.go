@@ -47,10 +47,18 @@ type CronDeps struct {
 // Cron drives per-user digest jobs. Each user's HH:MM times become a
 // gocron DailyJob that publishes a delivery.scheduled message. The cron
 // periodically reloads the user list to pick up changes from settings.
+//
+// gocron v2 only supports a scheduler-wide location, not a per-job one,
+// so we keep one Scheduler instance per IANA timezone. That way DST
+// transitions are handled correctly by gocron itself — a user in
+// Europe/Berlin keeps firing at local 09:00 across the March/October
+// jumps without any wall-clock conversion in this package.
 type Cron struct {
-	s     gocron.Scheduler
 	d     CronDeps
 	clock clockwork.Clock
+	// schedulers is keyed by IANA timezone string; we lazily build one
+	// gocron.Scheduler per location seen in the user list.
+	schedulers map[string]gocron.Scheduler
 }
 
 // NewCron constructs a Cron. The scheduler is not started yet — call
@@ -71,15 +79,27 @@ func NewCron(d CronDeps) (*Cron, error) {
 		clock = clockwork.NewRealClock()
 	}
 
-	// Force scheduler-wide UTC: we convert each user's local HH:MM to
-	// UTC HH:MM in scheduleUser, so gocron must interpret AtTimes in
-	// UTC. Without this, gocron defaults to time.Local and the at-times
-	// are mis-aligned by the system offset.
-	s, err := gocron.NewScheduler(gocron.WithClock(clock), gocron.WithLocation(time.UTC))
+	return &Cron{d: d, clock: clock, schedulers: make(map[string]gocron.Scheduler)}, nil
+}
+
+// schedulerFor returns the gocron.Scheduler bound to loc, creating one on
+// first use. The scheduler is auto-started so jobs registered against it
+// after the initial Start() still fire — reload may discover a new TZ.
+func (c *Cron) schedulerFor(loc *time.Location) (gocron.Scheduler, error) {
+	key := loc.String()
+	if s, ok := c.schedulers[key]; ok {
+		return s, nil
+	}
+	s, err := gocron.NewScheduler(gocron.WithClock(c.clock), gocron.WithLocation(loc))
 	if err != nil {
 		return nil, fmt.Errorf("new scheduler: %w", err)
 	}
-	return &Cron{s: s, d: d, clock: clock}, nil
+	c.schedulers[key] = s
+	// Newly-created schedulers must be started right away; the top-level
+	// Start() iterates the map once before reload returns. Calling Start
+	// again on an already-running scheduler is a noop per gocron docs.
+	s.Start()
+	return s, nil
 }
 
 // Start performs the initial user load, schedules per-user jobs, and
@@ -89,16 +109,20 @@ func (c *Cron) Start(ctx context.Context) error {
 	if err := c.reload(ctx); err != nil {
 		return err
 	}
-	c.s.Start()
+	for _, s := range c.schedulers {
+		s.Start()
+	}
 	go c.reloadLoop(ctx)
 	return nil
 }
 
-// Stop shuts down the underlying gocron scheduler. After Stop, the
-// Cron cannot be restarted; construct a new one.
+// Stop shuts down every per-timezone scheduler. After Stop, the Cron
+// cannot be restarted; construct a new one.
 func (c *Cron) Stop() error {
-	if err := c.s.Shutdown(); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
+	for _, s := range c.schedulers {
+		if err := s.Shutdown(); err != nil {
+			return fmt.Errorf("shutdown: %w", err)
+		}
 	}
 	return nil
 }
@@ -125,8 +149,10 @@ func (c *Cron) reload(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load users: %w", err)
 	}
-	for _, j := range c.s.Jobs() {
-		_ = c.s.RemoveJob(j.ID())
+	for _, s := range c.schedulers {
+		for _, j := range s.Jobs() {
+			_ = s.RemoveJob(j.ID())
+		}
 	}
 	for _, u := range users {
 		c.scheduleUser(u)
@@ -134,33 +160,30 @@ func (c *Cron) reload(ctx context.Context) error {
 	return nil
 }
 
-// scheduleUser registers one gocron daily job per user time. Because
-// gocron v2 has only a scheduler-wide WithLocation (no per-job option),
-// we convert the user's local HH:MM to UTC HH:MM using the current
-// offset and schedule daily at that UTC time. DST transitions can shift
-// the user's local fire time by ±1 hour until the next reload re-evaluates
-// the offset — acceptable for the MVP at 5-minute reload cadence.
+// scheduleUser registers one gocron daily job per user time. Jobs are
+// attached to the per-timezone scheduler returned by schedulerFor, so
+// gocron interprets the at-time in the user's local TZ and follows DST
+// transitions automatically (no manual ±1h compensation here).
 func (c *Cron) scheduleUser(u UserSchedule) {
 	loc, err := time.LoadLocation(u.TZ)
 	if err != nil {
 		loc = time.UTC
 	}
-	now := c.clock.Now().In(loc)
+	s, err := c.schedulerFor(loc)
+	if err != nil {
+		return
+	}
 	for _, hhmm := range u.Times {
-		hm, err := time.ParseInLocation("15:04", hhmm, loc)
+		hm, err := time.Parse("15:04", hhmm)
 		if err != nil {
 			continue
 		}
-		// Build today's local instant at HH:MM, then convert to UTC to
-		// get the correct UTC HH:MM under the user's current offset.
-		local := time.Date(now.Year(), now.Month(), now.Day(), hm.Hour(), hm.Minute(), 0, 0, loc)
-		utc := local.UTC()
-		// #nosec G115 -- utc.Hour() and utc.Minute() are bounded 0..59 by time package
-		atTime := gocron.NewAtTime(uint(utc.Hour()), uint(utc.Minute()), 0)
+		// #nosec G115 -- hm.Hour()/Minute() are bounded by the time package
+		atTime := gocron.NewAtTime(uint(hm.Hour()), uint(hm.Minute()), 0)
 
 		userID := u.UserID
 		tgUserID := u.TGUserID
-		_, err = c.s.NewJob(
+		_, err = s.NewJob(
 			gocron.DailyJob(1, gocron.NewAtTimes(atTime)),
 			gocron.NewTask(func() {
 				_ = c.d.Publisher.Publish(context.Background(), queue.SubjectDeliverySched,

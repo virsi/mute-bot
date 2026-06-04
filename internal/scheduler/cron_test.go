@@ -83,3 +83,44 @@ func TestCron_FiresPerUser(t *testing.T) {
 	require.Equal(t, int64(100), payload["tg_user_id"])
 	require.Equal(t, "digest", payload["channel"])
 }
+
+// TestCron_PerLocationScheduler asserts that NewCron lazily builds one
+// gocron.Scheduler per distinct user timezone. This is the structural
+// guarantee that fixes the DST drift bug: each scheduler is constructed
+// with gocron.WithLocation(loc) so daily at-times are interpreted in the
+// user's local TZ and gocron handles the spring-forward / fall-back
+// boundaries automatically.
+func TestCron_PerLocationScheduler(t *testing.T) {
+	t.Parallel()
+
+	fake := clockwork.NewFakeClockAt(time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC))
+
+	publish := pubFunc(func(_ context.Context, _ string, _ any) error { return nil })
+	loader := func(_ context.Context) ([]UserSchedule, error) {
+		return []UserSchedule{
+			{UserID: 1, TGUserID: 100, Times: []string{"09:00"}, TZ: "Europe/Berlin"},
+			{UserID: 2, TGUserID: 200, Times: []string{"09:00"}, TZ: "Europe/Moscow"},
+			{UserID: 3, TGUserID: 300, Times: []string{"09:00"}, TZ: "Europe/Berlin"},
+			{UserID: 4, TGUserID: 400, Times: []string{"09:00"}, TZ: "UTC"},
+		}, nil
+	}
+
+	c, err := NewCron(CronDeps{
+		LoadUsers: loader,
+		Publisher: publish,
+		Clock:     fake,
+		Reload:    time.Hour,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Stop() })
+
+	// 3 distinct TZs ⇒ 3 schedulers. Berlin users share one.
+	require.Len(t, c.schedulers, 3)
+	require.Contains(t, c.schedulers, "Europe/Berlin")
+	require.Contains(t, c.schedulers, "Europe/Moscow")
+	require.Contains(t, c.schedulers, "UTC")
+}
