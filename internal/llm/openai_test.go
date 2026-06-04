@@ -12,7 +12,7 @@ import (
 
 func TestOpenAI_Embed_HitsMockServer(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"data": []map[string]any{

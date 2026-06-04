@@ -1,3 +1,5 @@
+// Package config loads the root YAML configuration shared by every binary
+// and applies environment-variable overrides (and ${VAR} expansion).
 package config
 
 import (
@@ -9,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Config is the root YAML configuration shared by every binary.
 type Config struct {
 	PostgresDSN  string  `yaml:"postgres_dsn"`
 	RedisAddr    string  `yaml:"redis_addr"`
@@ -20,12 +23,14 @@ type Config struct {
 	LLM          LLM     `yaml:"llm"`
 }
 
+// MTProto groups MTProto user-session credentials.
 type MTProto struct {
 	APIID       int    `yaml:"api_id"`
 	APIHash     string `yaml:"api_hash"`
 	SessionPath string `yaml:"session_path"`
 }
 
+// LLM groups OpenAI-compatible client settings and per-month budget.
 type LLM struct {
 	MonthlyBudgetUSD float64 `yaml:"monthly_budget_usd"`
 	EmbeddingModel   string  `yaml:"embedding_model"`
@@ -33,6 +38,7 @@ type LLM struct {
 	BaseURL          string  `yaml:"openai_base_url"`
 }
 
+// Load reads, env-expands and validates the YAML at path.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {

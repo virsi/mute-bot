@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// OpenAIConfig configures NewOpenAI.
 type OpenAIConfig struct {
 	APIKey  string
 	BaseURL string // default https://api.openai.com
@@ -17,6 +18,7 @@ type OpenAIConfig struct {
 	HTTP    *http.Client
 }
 
+// OpenAI is the HTTP client for OpenAI-compatible Chat and Embed endpoints.
 type OpenAI struct {
 	cfg OpenAIConfig
 }
@@ -24,6 +26,8 @@ type OpenAI struct {
 // Compile-time check that *OpenAI satisfies the Provider interface.
 var _ Provider = (*OpenAI)(nil)
 
+// NewOpenAI constructs a client. BaseURL defaults to https://api.openai.com;
+// HTTP defaults to a 30s-timeout http.Client. Budget is mandatory.
 func NewOpenAI(cfg OpenAIConfig) *OpenAI {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://api.openai.com"
@@ -41,6 +45,7 @@ const (
 	chatMiniOutputUSDPerM   = 0.60
 )
 
+// Embed asks the embeddings endpoint for vectors over req.Texts.
 func (o *OpenAI) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, error) {
 	cost := embedSmallUSDPerMillion * float64(estimateTokens(req.Texts)) / 1_000_000
 	if err := o.cfg.Budget.Charge(ctx, cost); err != nil {
@@ -92,6 +97,7 @@ func (o *OpenAI) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, er
 	return out, nil
 }
 
+// Chat sends a single-turn (system + user) chat completion.
 func (o *OpenAI) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
 	estIn := estimateTokensOne(req.System) + estimateTokensOne(req.User)
 	estOut := req.MaxTokens
