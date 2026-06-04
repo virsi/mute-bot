@@ -119,6 +119,8 @@ func TestCron_PerLocationScheduler(t *testing.T) {
 	t.Cleanup(func() { _ = c.Stop() })
 
 	// 3 distinct TZs ⇒ 3 schedulers. Berlin users share one.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	require.Len(t, c.schedulers, 3)
 	require.Contains(t, c.schedulers, "Europe/Berlin")
 	require.Contains(t, c.schedulers, "Europe/Moscow")

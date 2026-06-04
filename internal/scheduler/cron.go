@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
@@ -56,6 +57,10 @@ type CronDeps struct {
 type Cron struct {
 	d     CronDeps
 	clock clockwork.Clock
+	// mu guards schedulers against concurrent reload + Stop. reload runs
+	// on its own goroutine; Stop runs on the shutdown path; jobs fired
+	// by gocron do not touch the map.
+	mu sync.Mutex
 	// schedulers is keyed by IANA timezone string; we lazily build one
 	// gocron.Scheduler per location seen in the user list.
 	schedulers map[string]gocron.Scheduler
@@ -85,6 +90,7 @@ func NewCron(d CronDeps) (*Cron, error) {
 // schedulerFor returns the gocron.Scheduler bound to loc, creating one on
 // first use. The scheduler is auto-started so jobs registered against it
 // after the initial Start() still fire — reload may discover a new TZ.
+// Caller must hold c.mu.
 func (c *Cron) schedulerFor(loc *time.Location) (gocron.Scheduler, error) {
 	key := loc.String()
 	if s, ok := c.schedulers[key]; ok {
@@ -109,9 +115,11 @@ func (c *Cron) Start(ctx context.Context) error {
 	if err := c.reload(ctx); err != nil {
 		return err
 	}
+	c.mu.Lock()
 	for _, s := range c.schedulers {
 		s.Start()
 	}
+	c.mu.Unlock()
 	go c.reloadLoop(ctx)
 	return nil
 }
@@ -119,11 +127,14 @@ func (c *Cron) Start(ctx context.Context) error {
 // Stop shuts down every per-timezone scheduler. After Stop, the Cron
 // cannot be restarted; construct a new one.
 func (c *Cron) Stop() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, s := range c.schedulers {
 		if err := s.Shutdown(); err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}
 	}
+	c.schedulers = make(map[string]gocron.Scheduler)
 	return nil
 }
 
@@ -144,27 +155,41 @@ func (c *Cron) reloadLoop(ctx context.Context) {
 // user list. We rebuild from scratch rather than diff because the job
 // count is small (≤ users × times-per-user) and the simplicity of
 // "drop and re-add" beats incremental diff bookkeeping.
+//
+// After re-registering, any per-timezone scheduler that no longer has
+// jobs (because every user it served changed TZ or was removed) is
+// shut down and dropped from the map, preventing an unbounded number of
+// stale schedulers from accumulating across long-running reloads.
 func (c *Cron) reload(ctx context.Context) error {
 	users, err := c.d.LoadUsers(ctx)
 	if err != nil {
 		return fmt.Errorf("load users: %w", err)
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, s := range c.schedulers {
 		for _, j := range s.Jobs() {
 			_ = s.RemoveJob(j.ID())
 		}
 	}
 	for _, u := range users {
-		c.scheduleUser(u)
+		c.scheduleUserLocked(u)
+	}
+	for key, s := range c.schedulers {
+		if len(s.Jobs()) == 0 {
+			_ = s.Shutdown()
+			delete(c.schedulers, key)
+		}
 	}
 	return nil
 }
 
-// scheduleUser registers one gocron daily job per user time. Jobs are
-// attached to the per-timezone scheduler returned by schedulerFor, so
+// scheduleUserLocked registers one gocron daily job per user time. Jobs
+// are attached to the per-timezone scheduler returned by schedulerFor, so
 // gocron interprets the at-time in the user's local TZ and follows DST
-// transitions automatically (no manual ±1h compensation here).
-func (c *Cron) scheduleUser(u UserSchedule) {
+// transitions automatically (no manual ±1h compensation here). Caller
+// must hold c.mu.
+func (c *Cron) scheduleUserLocked(u UserSchedule) {
 	loc, err := time.LoadLocation(u.TZ)
 	if err != nil {
 		loc = time.UTC

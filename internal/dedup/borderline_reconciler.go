@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	redisstore "github.com/virsi/mute-bot/internal/storage/redis"
@@ -49,7 +50,14 @@ type ReconcilerDeps struct {
 // per pair, and merges clusters when same=true && confidence >= MinConfidence.
 // It is the slow-path counterpart to Matcher.Match — the matcher emits the
 // pair on the hot path, the reconciler resolves it asynchronously.
-type Reconciler struct{ d ReconcilerDeps }
+type Reconciler struct {
+	d ReconcilerDeps
+	// stepMu serialises Step. Run() guarantees only one in-flight Step at a
+	// time (single-goroutine ticker drops late ticks), but tests and manual
+	// triggers can race; the mutex protects Drain+Merge from concurrent
+	// callers in those cases.
+	stepMu sync.Mutex
+}
 
 // NewReconciler constructs a Reconciler with sensible defaults applied.
 func NewReconciler(d ReconcilerDeps) *Reconciler {
@@ -66,6 +74,24 @@ func NewReconciler(d ReconcilerDeps) *Reconciler {
 		d.Logger = slog.Default()
 	}
 	return &Reconciler{d: d}
+}
+
+// stepLocked is the body of Step protected by stepMu so concurrent callers
+// can't double-drain the same borderline pair from Redis.
+func (r *Reconciler) stepLocked(ctx context.Context) error {
+	pairs, err := r.d.Queue.Drain(ctx, r.d.BatchSize)
+	if err != nil {
+		return fmt.Errorf("drain: %w", err)
+	}
+	for _, p := range pairs {
+		if err := r.judgeOne(ctx, p); err != nil {
+			r.d.Logger.WarnContext(ctx, "judge pair",
+				slog.Int64("post", p.PostID),
+				slog.Int64("cand", p.CandidateID),
+				slog.Any("err", err))
+		}
+	}
+	return nil
 }
 
 // Run blocks until ctx is cancelled, calling Step on every tick. A failing
@@ -89,19 +115,9 @@ func (r *Reconciler) Run(ctx context.Context) error {
 // Step drains BatchSize pairs and acts on each. A judgement failure on one
 // pair is logged and skipped; subsequent pairs are still processed.
 func (r *Reconciler) Step(ctx context.Context) error {
-	pairs, err := r.d.Queue.Drain(ctx, r.d.BatchSize)
-	if err != nil {
-		return fmt.Errorf("drain: %w", err)
-	}
-	for _, p := range pairs {
-		if err := r.judgeOne(ctx, p); err != nil {
-			r.d.Logger.WarnContext(ctx, "judge pair",
-				slog.Int64("post", p.PostID),
-				slog.Int64("cand", p.CandidateID),
-				slog.Any("err", err))
-		}
-	}
-	return nil
+	r.stepMu.Lock()
+	defer r.stepMu.Unlock()
+	return r.stepLocked(ctx)
 }
 
 // judgeOne loads both texts, asks the judge, and merges the two clusters if
