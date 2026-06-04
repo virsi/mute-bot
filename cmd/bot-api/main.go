@@ -168,8 +168,7 @@ func run() error {
 // without further plumbing. M2 itself ships only Free-accessible
 // commands plus the /buy stub.
 func registerHandlers(b *tgbot.Bot, h *bot.Handlers, reg bot.Registrar, sender bot.SendAPI) {
-	_ = reg    // referenced by M4/M5 Pro-only command wrappers
-	_ = sender // ditto
+	tier, _ := reg.(bot.TierChecker) // users.Service satisfies both ports
 
 	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/start", tgbot.MatchTypePrefix,
 		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
@@ -275,6 +274,39 @@ func registerHandlers(b *tgbot.Bot, h *bot.Handlers, reg bot.Registrar, sender b
 			}
 			if err := h.HandleBuy(ctx, u.Message.From.ID, u.Message.From.Username); err != nil {
 				slog.Error("/buy failed", slog.Any("err", err))
+			}
+		},
+	)
+
+	// /alerts is Pro-only. Resolve the user via the Registrar (idempotent,
+	// returning users get their existing row), check tier, and either
+	// dispatch to HandleAlerts or reply with the upgrade message. We
+	// inline the gate here instead of reusing RequirePro because /alerts
+	// carries variadic args that the CommandHandler signature does not.
+	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/alerts", tgbot.MatchTypePrefix,
+		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
+			if u.Message == nil || u.Message.From == nil {
+				return
+			}
+			ru, _, err := reg.RegisterOnStart(ctx, u.Message.From.ID, u.Message.From.Username)
+			if err != nil {
+				slog.Error("/alerts resolve user", slog.Any("err", err))
+				return
+			}
+			if tier == nil || !tier.IsPro(ru) {
+				if err := sender.Send(ctx, u.Message.From.ID,
+					"Эта команда доступна в Pro-подписке. Используй /buy"); err != nil {
+					slog.Error("/alerts gate reply", slog.Any("err", err))
+				}
+				return
+			}
+			parts := strings.Fields(u.Message.Text)
+			var args []string
+			if len(parts) > 1 {
+				args = parts[1:]
+			}
+			if err := h.HandleAlerts(ctx, u.Message.From.ID, u.Message.From.Username, args); err != nil {
+				slog.Error("/alerts failed", slog.Any("err", err))
 			}
 		},
 	)
