@@ -1,11 +1,11 @@
 // Command processor hosts the stateless pipeline workers as a single
 // binary:
 //
-//   ingest.raw          → normalizer        → ingest.normalized
-//   ingest.normalized   → dedup matcher     → cluster.updated
-//   cluster.updated     → classifier        → cluster.scored
-//   cluster.scored      → ranker            → (score persisted)
-//   delivery.scheduled  → digest assembler  → bot send
+//	ingest.raw          → normalizer        → ingest.normalized
+//	ingest.normalized   → dedup matcher     → cluster.updated
+//	cluster.updated     → classifier        → cluster.scored
+//	cluster.scored      → ranker            → (score persisted)
+//	delivery.scheduled  → digest assembler  → bot send
 //
 // Each consumer runs in its own goroutine driven by queue.Subscriber, which
 // applies the standard retry-with-backoff + DLQ semantics around the

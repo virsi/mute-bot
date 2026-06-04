@@ -69,7 +69,7 @@ func (o *OpenAI) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, er
 	if err != nil {
 		return EmbedResponse{}, fmt.Errorf("embed http: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode >= 400 {
 		raw, _ := io.ReadAll(res.Body)
 		return EmbedResponse{}, fmt.Errorf("openai embed %d: %s", res.StatusCode, string(raw))
@@ -129,7 +129,7 @@ func (o *OpenAI) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("chat http: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode >= 400 {
 		raw, _ := io.ReadAll(res.Body)
 		return ChatResponse{}, fmt.Errorf("openai chat %d: %s", res.StatusCode, string(raw))

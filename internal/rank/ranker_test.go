@@ -10,7 +10,7 @@ import (
 )
 
 type fakeClusters struct {
-	snap   Snapshot
+	snap    Snapshot
 	snapErr error
 	setErr  error
 

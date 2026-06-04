@@ -44,17 +44,15 @@ func TestClassifier_Parses(t *testing.T) {
 	require.Equal(t, "gpt-4o-mini", lm.lastRequest.Model)
 }
 
-func TestClassifier_InvalidJSON_FallsBack(t *testing.T) {
+func TestClassifier_InvalidJSON_ReturnsError(t *testing.T) {
 	c := NewClassifier(ClassifierDeps{
 		LLM:   &fakeLLM{resp: "not json"},
 		Model: "gpt-4o-mini",
 	})
 
-	res, err := c.Classify(context.Background(), []string{"x"}, "ru")
-	require.NoError(t, err)
-	require.Empty(t, res.Topics)
-	require.Equal(t, 0, res.Severity)
-	require.Empty(t, res.Headline)
+	_, err := c.Classify(context.Background(), []string{"x"}, "ru")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "parse llm response")
 }
 
 func TestClassifier_DefaultsLangToRu(t *testing.T) {

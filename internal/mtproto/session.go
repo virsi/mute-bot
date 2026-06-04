@@ -82,7 +82,7 @@ type passwordAuth struct {
 	pass  func(ctx context.Context) (string, error)
 }
 
-func (p passwordAuth) Phone(_ context.Context) (string, error)    { return p.phone, nil }
+func (p passwordAuth) Phone(_ context.Context) (string, error)      { return p.phone, nil }
 func (p passwordAuth) Password(ctx context.Context) (string, error) { return p.pass(ctx) }
 
 func (p passwordAuth) Code(ctx context.Context, sent *tg.AuthSentCode) (string, error) {

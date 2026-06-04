@@ -175,7 +175,7 @@ func (w *Worker) fetch(ctx context.Context, username string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("status %d", res.StatusCode)
 	}

@@ -65,8 +65,7 @@ func (c *Classifier) Classify(ctx context.Context, posts []string, lang string) 
 
 	var r Result
 	if err := json.Unmarshal([]byte(strings.TrimSpace(resp.Text)), &r); err != nil {
-		// Graceful fallback — caller treats empty Topics as "Other".
-		return Result{}, nil
+		return Result{}, fmt.Errorf("parse llm response: %w", err)
 	}
 	if r.Severity < 0 {
 		r.Severity = 0

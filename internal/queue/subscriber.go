@@ -136,6 +136,7 @@ func (s *Subscriber) handleMessage(ctx context.Context, cfg SubscribeConfig, pub
 		return
 	}
 
+	// #nosec G115 -- cfg.MaxDeliver is validated >0 at Run() entry
 	if delivered >= uint64(cfg.MaxDeliver) {
 		s.sendToDLQ(ctx, cfg, pub, msg, herr, delivered)
 		return
