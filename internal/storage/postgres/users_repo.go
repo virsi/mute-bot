@@ -50,6 +50,26 @@ func (r *UsersRepo) GetOrCreate(ctx context.Context, tgID int64, username string
 	return u, created, nil
 }
 
+// GetByID returns the user row by internal id. Used by the digest
+// assembler to find out the tier of the recipient before applying the
+// Pro-only custom-topic filter; pgx.ErrNoRows is surfaced verbatim so
+// callers can branch on errors.Is.
+func (r *UsersRepo) GetByID(ctx context.Context, id int64) (User, error) {
+	const q = `
+		SELECT id, tg_user_id, COALESCE(tg_username, ''), tier, tier_until,
+		       trial_used, lang, blocked, created_at
+		  FROM users
+		 WHERE id = $1`
+	var u User
+	if err := r.p.Pool().QueryRow(ctx, q, id).Scan(
+		&u.ID, &u.TGUserID, &u.Username, &u.Tier, &u.TierUntil,
+		&u.TrialUsed, &u.Lang, &u.Blocked, &u.CreatedAt,
+	); err != nil {
+		return User{}, fmt.Errorf("get user by id: %w", err)
+	}
+	return u, nil
+}
+
 // SetBlocked flips the blocked flag (used when Telegram returns
 // "bot was blocked by the user" on send).
 func (r *UsersRepo) SetBlocked(ctx context.Context, id int64, blocked bool) error {
@@ -119,6 +139,49 @@ func (r *UsersRepo) SetTier(ctx context.Context, id int64, tier string, until *t
 		return fmt.Errorf("set tier: %w", err)
 	}
 	return nil
+}
+
+// AlertEligible is the read model joining users + user_settings into one
+// row per Pro user with alerts_enabled = true. The alerts worker uses it
+// to decide who receives a real-time push without N+1 lookups.
+type AlertEligible struct {
+	UserID      int64
+	TGUserID    int64
+	Threshold   int
+	ThrottleMin int
+}
+
+// ListAlertEligible returns every non-blocked Pro user whose tier_until
+// has not passed (NULL = lifetime) and whose alerts_enabled flag is set.
+// The single JOIN keeps the lookup cheap even with a few thousand Pro
+// users — adding an index on (tier, alerts_enabled) would be a follow-up
+// optimisation if needed.
+func (r *UsersRepo) ListAlertEligible(ctx context.Context) ([]AlertEligible, error) {
+	const q = `
+		SELECT u.id, u.tg_user_id, s.alert_threshold, s.alert_throttle_minutes
+		  FROM users u
+		  JOIN user_settings s ON s.user_id = u.id
+		 WHERE u.blocked = false
+		   AND u.tier = 'pro'
+		   AND (u.tier_until IS NULL OR u.tier_until > now())
+		   AND s.alerts_enabled = true`
+	rows, err := r.p.Pool().Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("list alert eligible: %w", err)
+	}
+	defer rows.Close()
+	var out []AlertEligible
+	for rows.Next() {
+		var e AlertEligible
+		if err := rows.Scan(&e.UserID, &e.TGUserID, &e.Threshold, &e.ThrottleMin); err != nil {
+			return nil, fmt.Errorf("scan eligible: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows err: %w", err)
+	}
+	return out, nil
 }
 
 // BulkDowngradeExpired atomically downgrades every Pro user whose

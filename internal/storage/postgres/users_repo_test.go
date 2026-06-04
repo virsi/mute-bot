@@ -113,6 +113,29 @@ func TestUsersRepo_ListExpired(t *testing.T) {
 	require.Equal(t, []int64{u1.ID}, ids)
 }
 
+func TestUsersRepo_GetByID(t *testing.T) {
+	p := setupTestPool(t)
+	truncate(t, p, "users")
+	ctx := context.Background()
+	r := NewUsersRepo(p)
+
+	u, _, err := r.GetOrCreate(ctx, 5555, "z")
+	require.NoError(t, err)
+
+	got, err := r.GetByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, u.ID, got.ID)
+	require.Equal(t, int64(5555), got.TGUserID)
+	require.Equal(t, "free", got.Tier)
+
+	// Pro user with a tier_until comes back with the deadline intact.
+	require.NoError(t, r.GrantPro(ctx, u.ID, 30*24*time.Hour))
+	pro, err := r.GetByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, "pro", pro.Tier)
+	require.NotNil(t, pro.TierUntil)
+}
+
 func TestUsersRepo_SetTier(t *testing.T) {
 	p := setupTestPool(t)
 	truncate(t, p, "users")
@@ -128,6 +151,65 @@ func TestUsersRepo_SetTier(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "free", u2.Tier)
 	require.Nil(t, u2.TierUntil)
+}
+
+func TestUsersRepo_ListAlertEligible(t *testing.T) {
+	p := setupTestPool(t)
+	truncate(t, p, "users")
+	ctx := context.Background()
+	ur := NewUsersRepo(p)
+	sr := NewSettingsRepo(p)
+
+	// Pro + alerts_enabled — eligible.
+	pro, _, err := ur.GetOrCreate(ctx, 10001, "pro")
+	require.NoError(t, err)
+	require.NoError(t, ur.GrantPro(ctx, pro.ID, 30*24*time.Hour))
+	require.NoError(t, sr.Upsert(ctx, pro.ID, SettingsUpdate{
+		Topics: []string{}, Threshold: 50,
+		AlertsEnabled: true, AlertThreshold: 80, AlertThrottleMin: 20,
+	}))
+
+	// Pro but alerts_enabled = false — excluded.
+	silent, _, err := ur.GetOrCreate(ctx, 10002, "silent")
+	require.NoError(t, err)
+	require.NoError(t, ur.GrantPro(ctx, silent.ID, 30*24*time.Hour))
+	require.NoError(t, sr.Upsert(ctx, silent.ID, SettingsUpdate{
+		Topics: []string{}, Threshold: 50, AlertsEnabled: false,
+	}))
+
+	// Free user with alerts_enabled = true — excluded (tier check).
+	free, _, err := ur.GetOrCreate(ctx, 10003, "free")
+	require.NoError(t, err)
+	require.NoError(t, sr.Upsert(ctx, free.ID, SettingsUpdate{
+		Topics: []string{}, Threshold: 50, AlertsEnabled: true,
+	}))
+
+	// Pro expired — excluded.
+	expired, _, err := ur.GetOrCreate(ctx, 10004, "expired")
+	require.NoError(t, err)
+	_, err = p.Pool().Exec(ctx,
+		`UPDATE users SET tier='pro', tier_until=now()-interval '1 hour' WHERE id=$1`, expired.ID)
+	require.NoError(t, err)
+	require.NoError(t, sr.Upsert(ctx, expired.ID, SettingsUpdate{
+		Topics: []string{}, Threshold: 50, AlertsEnabled: true,
+	}))
+
+	// Pro blocked — excluded.
+	blocked, _, err := ur.GetOrCreate(ctx, 10005, "blocked")
+	require.NoError(t, err)
+	require.NoError(t, ur.GrantPro(ctx, blocked.ID, 30*24*time.Hour))
+	require.NoError(t, ur.SetBlocked(ctx, blocked.ID, true))
+	require.NoError(t, sr.Upsert(ctx, blocked.ID, SettingsUpdate{
+		Topics: []string{}, Threshold: 50, AlertsEnabled: true,
+	}))
+
+	out, err := ur.ListAlertEligible(ctx)
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Equal(t, pro.ID, out[0].UserID)
+	require.Equal(t, int64(10001), out[0].TGUserID)
+	require.Equal(t, 80, out[0].Threshold)
+	require.Equal(t, 20, out[0].ThrottleMin)
 }
 
 func TestSettingsRepo_UpsertGet(t *testing.T) {
