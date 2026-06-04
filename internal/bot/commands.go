@@ -3,12 +3,14 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/virsi/mute-bot/internal/storage/postgres"
+	"github.com/virsi/mute-bot/internal/topics"
 )
 
 // defaultScheduleTZ is the timezone applied when /schedule is invoked
@@ -92,11 +94,26 @@ type TierChecker interface {
 	IsPro(u postgres.User) bool
 }
 
+// TopicsService is the slice of topics.Service the /topics handlers
+// need. Kept narrow so unit tests can stub the entire service without
+// pulling in the embeddings dependency.
+//
+// AddTopic/RemoveTopic/ListTopics are the M4 Pro-only command surface;
+// the legacy /topics ID preset toggle continues to live in
+// HandleToggleTopic and is not part of this interface.
+type TopicsService interface {
+	AddTopic(ctx context.Context, userID int64, name string) error
+	RemoveTopic(ctx context.Context, userID int64, name string) error
+	ListTopics(ctx context.Context, userID int64) ([]string, error)
+}
+
 // HandlersDeps groups the handler collaborators. Assembler, Registrar
 // and Tier are optional in unit tests; production wiring must provide
 // all three so /start and /settings behave correctly. Invoicer and
 // ButtonAPI together unlock the real /buy flow — when either is nil the
 // command falls back to a stub message (preserved for the M2 milestone).
+// Topics is the M4 hook for the Pro-only custom-topic subsystem; when
+// nil the /topics add|remove|list handlers reply with a friendly stub.
 type HandlersDeps struct {
 	Users     UsersRepo
 	Settings  SettingsRepo
@@ -106,6 +123,7 @@ type HandlersDeps struct {
 	Tier      TierChecker
 	Invoicer  Invoicer
 	ButtonAPI URLButtonSender
+	Topics    TopicsService
 }
 
 // Handlers groups the per-command methods. One method per slash command;
@@ -450,4 +468,88 @@ func renderAlertsStatus(s postgres.Settings) string {
 		"Alerts: %s\nПорог: %d/100\nThrottle: %d мин",
 		state, s.AlertThreshold, s.AlertThrottleMin,
 	)
+}
+
+// HandleTopicsAdd implements /topics add NAME. Pro-only — the gate is
+// applied by the wiring layer (RequirePro middleware). This body assumes
+// the caller is already entitled and the Registrar has resolved/created
+// the user row. If the Topics service is nil (partial wiring) the
+// command falls back to a friendly stub so the bot never panics in dev.
+//
+// Errors mapped to user-facing messages:
+//
+//	topics.ErrTooManyTopics → "Лимит N кастомных тем"
+//	topics.ErrEmptyName     → "Имя темы пустое"
+func (h *Handlers) HandleTopicsAdd(ctx context.Context, tgUserID int64, username, name string) error {
+	if h.d.Topics == nil {
+		return h.d.API.Send(ctx, tgUserID, "Кастомные темы скоро будут доступны.")
+	}
+	u, _, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
+	if err != nil {
+		return fmt.Errorf("get_or_create user: %w", err)
+	}
+	if err := h.d.Topics.AddTopic(ctx, u.ID, name); err != nil {
+		switch {
+		case errors.Is(err, topics.ErrTooManyTopics):
+			return h.d.API.Send(ctx, tgUserID,
+				fmt.Sprintf("Лимит %d кастомных тем достигнут. Удалите одну через /topics remove.",
+					topics.MaxTopicsPerUser))
+		case errors.Is(err, topics.ErrEmptyName):
+			return h.d.API.Send(ctx, tgUserID, "Имя темы не должно быть пустым.")
+		case errors.Is(err, topics.ErrEmptyEmbedding):
+			return h.d.API.Send(ctx, tgUserID,
+				"Не удалось построить вектор для темы. Попробуйте позже.")
+		}
+		return fmt.Errorf("add topic: %w", err)
+	}
+	return h.d.API.Send(ctx, tgUserID, fmt.Sprintf("Тема %q добавлена.", strings.TrimSpace(name)))
+}
+
+// HandleTopicsRemove implements /topics remove NAME. Pro-only via the
+// wiring layer. Idempotent at the service level — removing a missing
+// row is silently treated as success so the user sees a consistent
+// confirmation even on retries.
+func (h *Handlers) HandleTopicsRemove(ctx context.Context, tgUserID int64, username, name string) error {
+	if h.d.Topics == nil {
+		return h.d.API.Send(ctx, tgUserID, "Кастомные темы скоро будут доступны.")
+	}
+	u, _, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
+	if err != nil {
+		return fmt.Errorf("get_or_create user: %w", err)
+	}
+	if err := h.d.Topics.RemoveTopic(ctx, u.ID, name); err != nil {
+		if errors.Is(err, topics.ErrEmptyName) {
+			return h.d.API.Send(ctx, tgUserID, "Использование: /topics remove <название>")
+		}
+		return fmt.Errorf("remove topic: %w", err)
+	}
+	return h.d.API.Send(ctx, tgUserID, fmt.Sprintf("Тема %q удалена.", strings.TrimSpace(name)))
+}
+
+// HandleTopicsList implements /topics list. Returns the names oldest-
+// first; an empty list gets a hint pointing the user at /topics add.
+func (h *Handlers) HandleTopicsList(ctx context.Context, tgUserID int64, username string) error {
+	if h.d.Topics == nil {
+		return h.d.API.Send(ctx, tgUserID, "Кастомные темы скоро будут доступны.")
+	}
+	u, _, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
+	if err != nil {
+		return fmt.Errorf("get_or_create user: %w", err)
+	}
+	names, err := h.d.Topics.ListTopics(ctx, u.ID)
+	if err != nil {
+		return fmt.Errorf("list topics: %w", err)
+	}
+	if len(names) == 0 {
+		return h.d.API.Send(ctx, tgUserID,
+			"У вас пока нет кастомных тем. Добавьте через /topics add <название>.")
+	}
+	var b strings.Builder
+	b.WriteString("Ваши темы:\n")
+	for _, n := range names {
+		b.WriteString("• ")
+		b.WriteString(n)
+		b.WriteByte('\n')
+	}
+	return h.d.API.Send(ctx, tgUserID, strings.TrimRight(b.String(), "\n"))
 }
