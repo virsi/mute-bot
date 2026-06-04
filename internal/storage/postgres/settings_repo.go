@@ -35,11 +35,21 @@ type SettingsRepo struct{ p *Pool }
 func NewSettingsRepo(p *Pool) *SettingsRepo { return &SettingsRepo{p: p} }
 
 // Upsert writes a settings row for userID, replacing any existing row.
+//
+// Zero values fall through to the table defaults so callers that only know
+// about a subset of fields (e.g. a /settings command that only sets topics)
+// don't accidentally wipe alert_threshold to 0 or null digest_schedule. The
+// COALESCE/NULLIF dance keeps the column-default semantics intact for
+// fresh-out-of-box rows as well as partial updates.
 func (r *SettingsRepo) Upsert(ctx context.Context, userID int64, in SettingsUpdate) error {
 	const q = `
 		INSERT INTO user_settings (user_id, topics, threshold, digest_schedule,
 		                           alerts_enabled, alert_threshold, weekly_enabled, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+		VALUES ($1, $2, $3,
+		        COALESCE($4, '{"times":["08:00","19:00"],"tz":"Europe/Moscow"}'::jsonb),
+		        $5,
+		        COALESCE(NULLIF($6, 0), 85),
+		        $7, now())
 		ON CONFLICT (user_id) DO UPDATE
 		   SET topics = EXCLUDED.topics,
 		       threshold = EXCLUDED.threshold,
