@@ -25,6 +25,7 @@ import (
 	"github.com/virsi/mute-bot/internal/digest"
 	"github.com/virsi/mute-bot/internal/obs"
 	"github.com/virsi/mute-bot/internal/storage/postgres"
+	"github.com/virsi/mute-bot/internal/users"
 )
 
 func main() {
@@ -87,11 +88,17 @@ func run() error {
 	// back-pressure at one message per command invocation.
 	sender := bot.NewSender(bot.SenderDeps{API: &client.SendOnly, PerChatPerSec: 1})
 
-	users := postgres.NewUsersRepo(pool)
+	usersRepo := postgres.NewUsersRepo(pool)
 	settings := postgres.NewSettingsRepo(pool)
 	clusters := postgres.NewClustersRepo(pool)
 	deliveries := postgres.NewDeliveriesRepo(pool)
 	channelsRepo := postgres.NewChannelsRepo(pool)
+
+	// usersSvc unifies /start, billing webhooks (M3) and the expiry sweep
+	// behind one service so the upsert + default-seed flow stays in one
+	// place. It also doubles as the TierChecker for /settings and the
+	// Pro-gate middleware below.
+	usersSvc := users.NewService(users.Deps{Users: usersRepo, Settings: settings})
 
 	assembler := digest.NewAssembler(digest.AssemblerDeps{
 		Settings:   settings,
@@ -113,13 +120,15 @@ func run() error {
 	})
 
 	h := bot.NewHandlers(bot.HandlersDeps{
-		Users:     users,
+		Users:     usersRepo,
 		Settings:  settings,
 		Assembler: asmAdapter,
 		API:       &client.SendOnly,
+		Registrar: usersSvc,
+		Tier:      usersSvc,
 	})
 
-	registerHandlers(client.Bot(), h)
+	registerHandlers(client.Bot(), h, usersSvc, &client.SendOnly)
 
 	slog.Info("bot-api: starting long poll")
 	client.Bot().Start(rootCtx)
@@ -133,7 +142,15 @@ func run() error {
 //
 // Errors returned from h.Handle* are logged and swallowed: a single failing
 // command should not stop the long-poll loop.
-func registerHandlers(b *tgbot.Bot, h *bot.Handlers) {
+//
+// reg + sender are accepted so M4/M5 can wrap newly-added Pro-only
+// commands with bot.RequirePro(reg, reg.(bot.TierChecker), sender, ...)
+// without further plumbing. M2 itself ships only Free-accessible
+// commands plus the /buy stub.
+func registerHandlers(b *tgbot.Bot, h *bot.Handlers, reg bot.Registrar, sender bot.SendAPI) {
+	_ = reg    // referenced by M4/M5 Pro-only command wrappers
+	_ = sender // ditto
+
 	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/start", tgbot.MatchTypePrefix,
 		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
 			if u.Message == nil || u.Message.From == nil {
@@ -225,6 +242,19 @@ func registerHandlers(b *tgbot.Bot, h *bot.Handlers) {
 			}
 			if err := h.HandleToggleTopic(ctx, u.Message.From.ID, u.Message.From.Username, parts[1]); err != nil {
 				slog.Error("/topics failed", slog.Any("err", err))
+			}
+		},
+	)
+	// /buy is intentionally NOT gated — Free users must reach the upgrade
+	// flow. M2 ships a stub message; M3 replaces the body with a real
+	// sendInvoice via the billing.Provider abstraction.
+	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/buy", tgbot.MatchTypePrefix,
+		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
+			if u.Message == nil || u.Message.From == nil {
+				return
+			}
+			if err := h.HandleBuy(ctx, u.Message.From.ID, u.Message.From.Username); err != nil {
+				slog.Error("/buy failed", slog.Any("err", err))
 			}
 		},
 	)

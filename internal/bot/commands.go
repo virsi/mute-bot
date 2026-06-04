@@ -63,14 +63,30 @@ type SendAPI interface {
 	Send(ctx context.Context, chatID int64, text string) error
 }
 
-// HandlersDeps groups the handler collaborators. Assembler is optional —
-// only /digest needs it, so a process that never runs /digest can leave
-// it nil.
+// Registrar is the slice of users.Service used on /start. Wrapping the
+// upsert + seed-defaults flow behind a single call keeps the handler
+// free of seeding logic that needs to stay in sync with billing flows.
+type Registrar interface {
+	RegisterOnStart(ctx context.Context, tgUserID int64, username string) (postgres.User, bool, error)
+}
+
+// TierChecker is the slice of users.Service used by /settings and the
+// Pro-gate middleware. Kept as a small interface so unit tests can stub
+// it without instantiating the full users.Service.
+type TierChecker interface {
+	IsPro(u postgres.User) bool
+}
+
+// HandlersDeps groups the handler collaborators. Assembler, Registrar
+// and Tier are optional in unit tests; production wiring must provide
+// all three so /start and /settings behave correctly.
 type HandlersDeps struct {
 	Users     UsersRepo
 	Settings  SettingsRepo
 	Assembler AssemblerIface
 	API       SendAPI
+	Registrar Registrar
+	Tier      TierChecker
 }
 
 // Handlers groups the per-command methods. One method per slash command;
@@ -96,11 +112,18 @@ const welcome = `Привет!
 
 По умолчанию: темы [politics, it], порог 50, расписание 08:00 и 19:00 (MSK).`
 
-// HandleStart implements /start. It upserts the user row and — on a fresh
-// creation — seeds default settings (topics [politics, it], threshold 50,
-// schedule 08:00/19:00 MSK). Returning users get only the welcome message;
-// their existing settings are preserved.
+// HandleStart implements /start. It delegates the upsert + first-touch
+// seeding to the Registrar (a users.Service) so the same flow drives
+// /start, billing webhooks, and any future entry-points. When no
+// Registrar is wired (unit tests), it falls back to the legacy inline
+// upsert + seed so existing tests stay valid.
 func (h *Handlers) HandleStart(ctx context.Context, tgUserID int64, username string) error {
+	if h.d.Registrar != nil {
+		if _, _, err := h.d.Registrar.RegisterOnStart(ctx, tgUserID, username); err != nil {
+			return fmt.Errorf("register: %w", err)
+		}
+		return h.d.API.Send(ctx, tgUserID, welcome)
+	}
 	u, created, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
 	if err != nil {
 		return fmt.Errorf("get_or_create user: %w", err)
@@ -264,6 +287,7 @@ func (h *Handlers) HandleSchedule(ctx context.Context, tgUserID int64, username,
 // HandleSettings implements /settings. Renders the current row as a
 // plain-text message. The schedule JSON is shown verbatim — Phase-1 users
 // edit it via /threshold and /topics, so seeing the raw JSON is acceptable.
+// The tier line shows the active plan and, for Pro users, the deadline.
 func (h *Handlers) HandleSettings(ctx context.Context, tgUserID int64, username string) error {
 	u, _, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
 	if err != nil {
@@ -273,9 +297,23 @@ func (h *Handlers) HandleSettings(ctx context.Context, tgUserID int64, username 
 	if err != nil {
 		return fmt.Errorf("get settings: %w", err)
 	}
+	tierLine := fmt.Sprintf("Тариф: %s", u.Tier)
+	if u.Tier == "pro" && u.TierUntil != nil {
+		tierLine += fmt.Sprintf(" (до %s)", u.TierUntil.Format("02 Jan 2006"))
+	}
 	text := fmt.Sprintf(
-		"Настройки:\n\nТемы: %v\nПорог: %d\nРасписание: %s\nТариф: %s",
-		s.Topics, s.Threshold, string(s.ScheduleJSON), u.Tier,
+		"Настройки:\n\nТемы: %v\nПорог: %d\nРасписание: %s\n%s",
+		s.Topics, s.Threshold, string(s.ScheduleJSON), tierLine,
 	)
 	return h.d.API.Send(ctx, tgUserID, text)
+}
+
+// HandleBuy implements /buy. Phase-2 M2 ships a placeholder reply —
+// the real TG-Stars invoice flow lands in M3. Returning a stub here
+// keeps the command registered so users see a sensible message instead
+// of "command not found".
+func (h *Handlers) HandleBuy(ctx context.Context, tgUserID int64, _ string) error {
+	return h.d.API.Send(ctx, tgUserID,
+		"Оплата подписки скоро будет доступна через Telegram Stars (99 XTR/мес). "+
+			"Сейчас функция в разработке.")
 }
