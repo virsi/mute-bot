@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -45,8 +46,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	expanded, err := expandEnv(raw)
+	if err != nil {
+		return nil, fmt.Errorf("expand env: %w", err)
+	}
 	var cfg Config
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	if err := yaml.Unmarshal(expanded, &cfg); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
 	}
 	applyEnvOverrides(&cfg)
@@ -54,6 +59,33 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// envRefRe matches shell-style ${VAR} references with an upper-case-only name
+// (digits and underscore allowed after the first char). Lower-case names are
+// deliberately excluded so casual literal "$" use in URLs doesn't trigger
+// expansion — only the explicit ${VAR} form does.
+var envRefRe = regexp.MustCompile(`\$\{([A-Z_][A-Z0-9_]*)\}`)
+
+// expandEnv replaces every ${VAR} reference in in with os.LookupEnv(VAR). If
+// any referenced variable is missing it returns an error listing them all —
+// silent expansion to empty would produce malformed DSNs and other gnarly
+// downstream errors.
+func expandEnv(in []byte) ([]byte, error) {
+	var missing []string
+	out := envRefRe.ReplaceAllFunc(in, func(match []byte) []byte {
+		name := string(envRefRe.FindSubmatch(match)[1])
+		v, ok := os.LookupEnv(name)
+		if !ok {
+			missing = append(missing, name)
+			return match
+		}
+		return []byte(v)
+	})
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("env vars not set: %v", missing)
+	}
+	return out, nil
 }
 
 func applyEnvOverrides(c *Config) {
