@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 	"github.com/virsi/mute-bot/internal/queue"
 	"github.com/virsi/mute-bot/internal/scheduler"
 	"github.com/virsi/mute-bot/internal/storage/postgres"
+	"github.com/virsi/mute-bot/internal/users"
 )
 
 func main() {
@@ -95,6 +97,20 @@ func run() error {
 	if err := cron.Start(rootCtx); err != nil {
 		return fmt.Errorf("cron start: %w", err)
 	}
+
+	// Hourly expiry sweep — runs alongside the cron so Pro users whose
+	// tier_until has passed get downgraded back to free even when they
+	// never touch the bot. Uses the users.Service Downgrader port.
+	usersSvc := users.NewService(users.Deps{
+		Users:    postgres.NewUsersRepo(pool),
+		Settings: postgres.NewSettingsRepo(pool),
+	})
+	sweeper := scheduler.NewExpirySweeper(usersSvc, time.Hour, nil, slog.Default())
+	go func() {
+		if err := sweeper.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("scheduler: expiry sweeper exited", slog.Any("err", err))
+		}
+	}()
 
 	slog.Info("scheduler: started")
 	<-rootCtx.Done()
