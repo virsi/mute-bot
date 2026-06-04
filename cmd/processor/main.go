@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -38,6 +39,7 @@ import (
 	"github.com/virsi/mute-bot/internal/rank"
 	"github.com/virsi/mute-bot/internal/storage/postgres"
 	rdb "github.com/virsi/mute-bot/internal/storage/redis"
+	"github.com/virsi/mute-bot/internal/topics"
 )
 
 func main() {
@@ -271,11 +273,21 @@ func run() error {
 	// The Topics matcher is a pass-through stub until M4's internal/topics
 	// service lands. When M4 wires its real matcher, this single line
 	// changes — the worker contract does not.
+	// Custom-topic matcher shared with bot-api's /topics commands.
+	// Reusing the same llmClient keeps the BudgetGuard accounting central.
+	topicsSvc := topics.NewService(topics.Deps{
+		Repo:     postgres.NewUserTopicsRepo(pool),
+		Embedder: llmClient,
+		Model:    cfg.LLM.EmbeddingModel,
+	})
 	alertThrottle := rdb.NewAlertThrottle(rclient)
 	alertWorker := alerts.NewWorker(alerts.Deps{
 		Users:    alertsUsersAdapter{repo: usersRepo},
 		Clusters: alertsClustersAdapter{repo: clustersRepo},
-		Topics:   alerts.PassThroughTopics{},
+		Topics: alertsTopicsAdapter{
+			topics:     topicsSvc,
+			embeddings: embeddingsRepo,
+		},
 		Throttle: alertThrottle,
 		Sender:   sender,
 	})
@@ -354,4 +366,26 @@ func (a alertsClustersAdapter) Get(ctx context.Context, id int64) (alerts.Cluste
 		Coverage: c.Coverage,
 		Score:    c.Score,
 	}, nil
+}
+
+// alertsTopicsAdapter bridges topics.Service (which expects a centroid
+// vector) to alerts.TopicMatcher (which only has userID + clusterID).
+// On every alert evaluation we fetch the cluster centroid via the
+// embeddings repo and pass it through. When the cluster has no
+// embeddings yet (ErrNoEmbeddings) the user accepts the alert — the
+// custom-topic filter is best-effort, never a hard gate.
+type alertsTopicsAdapter struct {
+	topics     *topics.Service
+	embeddings *postgres.EmbeddingsRepo
+}
+
+func (a alertsTopicsAdapter) MatchesAny(ctx context.Context, userID, clusterID int64) (bool, error) {
+	centroid, err := a.embeddings.ClusterCentroid(ctx, clusterID)
+	if err != nil {
+		if errors.Is(err, postgres.ErrNoEmbeddings) {
+			return true, nil
+		}
+		return false, err
+	}
+	return a.topics.MatchesAny(ctx, userID, centroid)
 }

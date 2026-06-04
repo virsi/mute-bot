@@ -85,7 +85,11 @@ func NewService(d Deps) *Service {
 // Returns ErrEmptyEmbedding when the embedder returns zero vectors.
 // Returns a wrapped error from the LLM or repo for other failures.
 func (s *Service) AddTopic(ctx context.Context, userID int64, name string) error {
-	name = strings.TrimSpace(name)
+	// Normalise to lowercase so "Politics" and "politics" collapse to the
+	// same UNIQUE(user_id, name) row — the DB collation is case-sensitive
+	// and would otherwise let a single user own near-duplicate topics that
+	// MatchesAny then evaluates twice.
+	name = strings.ToLower(strings.TrimSpace(name))
 	if name == "" {
 		return ErrEmptyName
 	}
@@ -112,7 +116,9 @@ func (s *Service) AddTopic(ctx context.Context, userID int64, name string) error
 // RemoveTopic deletes the named topic for userID. Idempotent — removing
 // a missing row is silently treated as success at the repo layer.
 func (s *Service) RemoveTopic(ctx context.Context, userID int64, name string) error {
-	name = strings.TrimSpace(name)
+	// Same lowercase normalisation as AddTopic so /topics remove matches
+	// the stored row regardless of how the user typed the name.
+	name = strings.ToLower(strings.TrimSpace(name))
 	if name == "" {
 		return ErrEmptyName
 	}

@@ -38,10 +38,11 @@ func (f *fakeClusters) Get(_ context.Context, _ int64) (Cluster, error) {
 // drives whether the slot is acquired. When fail is set, Allow returns an
 // error to simulate a Redis hiccup.
 type fakeThrottle struct {
-	allow   bool
-	fail    bool
-	calls   []throttleCall
-	perUser map[int64]bool // when set, overrides allow per user
+	allow    bool
+	fail     bool
+	calls    []throttleCall
+	releases []releaseCall
+	perUser  map[int64]bool // when set, overrides allow per user
 }
 
 type throttleCall struct {
@@ -59,6 +60,18 @@ func (f *fakeThrottle) Allow(_ context.Context, userID int64, topic string, ttl 
 		return v, nil
 	}
 	return f.allow, nil
+}
+
+// releaseCall records Release invocations so tests can pin the
+// throttle-release-on-send-failure behaviour.
+type releaseCall struct {
+	UserID int64
+	Topic  string
+}
+
+func (f *fakeThrottle) Release(_ context.Context, userID int64, topic string) error {
+	f.releases = append(f.releases, releaseCall{UserID: userID, Topic: topic})
+	return nil
 }
 
 // fakeSender records every SendDigest call.
@@ -157,6 +170,40 @@ func TestHandle_HappyPath_Sent(t *testing.T) {
 	require.Contains(t, send.sends[0].Text, "7")     // coverage
 	require.Equal(t, "war", thr.calls[0].Topic)
 	require.Equal(t, 30*time.Minute, thr.calls[0].TTL)
+}
+
+// TestHandle_SendFailure_ReleasesThrottle pins the post-review contract:
+// when SendDigest fails after Allow succeeded, the throttle slot is
+// freed so the next webhook retry can deliver the alert instead of the
+// user being locked out for the full TTL.
+func TestHandle_SendFailure_ReleasesThrottle(t *testing.T) {
+	users := &fakeUsers{list: []EligibleUser{{UserID: 1, TGUserID: 999, AlertThreshold: 50, ThrottleMin: 30}}}
+	thr := &fakeThrottle{allow: true}
+	send := &fakeSender{err: errors.New("tg down")}
+	cl := &fakeClusters{c: Cluster{
+		Headline: "x", Summary: "y", Coverage: 1, Topics: []string{"war"}, Score: 0.92,
+	}}
+	w := NewWorker(Deps{Users: users, Clusters: cl, Throttle: thr, Sender: send})
+
+	require.NoError(t, w.Handle(context.Background(), []byte(validPayload)))
+	require.Len(t, thr.releases, 1, "Release fired exactly once after send failure")
+	require.Equal(t, int64(1), thr.releases[0].UserID)
+	require.Equal(t, "war", thr.releases[0].Topic)
+}
+
+// TestHandle_NegativeThrottleMin_FallsBackToDefault ensures a corrupt
+// user_settings row (alert_throttle_minutes ≤ 0) cannot push a negative
+// TTL into Redis SETEX, which would otherwise fail the whole alert.
+func TestHandle_NegativeThrottleMin_FallsBackToDefault(t *testing.T) {
+	users := &fakeUsers{list: []EligibleUser{{UserID: 1, TGUserID: 7, AlertThreshold: 50, ThrottleMin: -5}}}
+	thr := &fakeThrottle{allow: true}
+	send := &fakeSender{}
+	cl := &fakeClusters{c: Cluster{Headline: "h", Summary: "s", Topics: []string{"war"}, Score: 0.9}}
+	w := NewWorker(Deps{Users: users, Clusters: cl, Throttle: thr, Sender: send})
+
+	require.NoError(t, w.Handle(context.Background(), []byte(validPayload)))
+	require.Len(t, thr.calls, 1)
+	require.Equal(t, 30*time.Minute, thr.calls[0].TTL, "negative ThrottleMin clamps to 30-min default")
 }
 
 func TestHandle_BurstyTraffic_OnlyOneSendPerWindow(t *testing.T) {
@@ -296,6 +343,8 @@ type stubThrottle struct {
 func (s stubThrottle) Allow(_ context.Context, _ int64, _ string, _ time.Duration) (bool, error) {
 	return s.fn()
 }
+
+func (s stubThrottle) Release(_ context.Context, _ int64, _ string) error { return nil }
 
 func TestPassThroughTopicsAlwaysMatches(t *testing.T) {
 	ok, err := PassThroughTopics{}.MatchesAny(context.Background(), 1, 2)
