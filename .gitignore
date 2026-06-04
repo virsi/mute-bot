@@ -9,3 +9,6 @@ coverage.out
 .idea/
 .vscode/
 .session
+
+configs/config.yaml
+configs/channels.yaml
