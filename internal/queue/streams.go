@@ -21,6 +21,12 @@ const (
 	SubjectDeliverySched = "delivery.scheduled"
 	SubjectDeliveryPro   = "delivery.pro"
 	SubjectDeliveryFree  = "delivery.free"
+	// SubjectDeliveryWeeklySched is the per-user weekly digest fan-out
+	// subject published by the scheduler on Sunday-18:00 (user TZ). The
+	// processor's weekly delivery worker consumes it and runs
+	// WeeklyAssembler.BuildWeekly. Stays inside the existing "delivery.>"
+	// wildcard owned by StreamDelivery — no nats EnsureStreams change.
+	SubjectDeliveryWeeklySched = "delivery.weekly_scheduled"
 )
 
 // DLQSuffix is appended to a subject when a message exhausts MaxDeliver and
