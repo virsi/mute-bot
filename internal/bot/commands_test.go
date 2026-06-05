@@ -341,15 +341,17 @@ func TestHandleBuy_NoInvoicerFallsBackToStub(t *testing.T) {
 
 // fakeInvoicer stubs the billing.Service surface used by /buy.
 type fakeInvoicer struct {
-	url      string
-	err      error
-	calls    int
-	lastUser int64
-	lastPlan string
+	url          string
+	err          error
+	calls        int
+	lastProvider string
+	lastUser     int64
+	lastPlan     string
 }
 
-func (f *fakeInvoicer) CreateInvoice(_ context.Context, tg int64, plan string) (string, error) {
+func (f *fakeInvoicer) CreateInvoice(_ context.Context, provider string, tg int64, plan string) (string, error) {
 	f.calls++
+	f.lastProvider = provider
 	f.lastUser = tg
 	f.lastPlan = plan
 	return f.url, f.err

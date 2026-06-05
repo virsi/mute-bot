@@ -94,9 +94,10 @@ type URLButtonSender interface {
 }
 
 // Invoicer is the surface HandleBuy calls into. Satisfied by
-// *billing.Service in production.
+// *billing.Service in production. provider keys the dispatch back to
+// the right Provider instance — "tg_stars" or "yookassa".
 type Invoicer interface {
-	CreateInvoice(ctx context.Context, tgUserID int64, plan string) (string, error)
+	CreateInvoice(ctx context.Context, provider string, tgUserID int64, plan string) (string, error)
 }
 
 // Registrar is the slice of users.Service used on /start. Wrapping the
@@ -467,7 +468,7 @@ func (h *Handlers) HandleBuy(ctx context.Context, tgUserID int64, username strin
 			return fmt.Errorf("register user: %w", err)
 		}
 	}
-	url, err := h.d.Invoicer.CreateInvoice(ctx, tgUserID, "pro_30d")
+	url, err := h.d.Invoicer.CreateInvoice(ctx, "tg_stars", tgUserID, "pro_30d")
 	if err != nil {
 		return fmt.Errorf("create invoice: %w", err)
 	}

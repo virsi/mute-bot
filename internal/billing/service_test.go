@@ -115,18 +115,71 @@ func newService(t *testing.T, p Provider, s SubsRepo, u Users) *Service {
 func TestService_CreateInvoice_DelegatesToProvider(t *testing.T) {
 	p := &stubProvider{name: "tg_stars", url: "https://t.me/$abc"}
 	svc := newService(t, p, newFakeSubs(), &fakeUsers{})
-	url, err := svc.CreateInvoice(context.Background(), 12345, PlanPro30d)
+	url, err := svc.CreateInvoice(context.Background(), "tg_stars", 12345, PlanPro30d)
 	require.NoError(t, err)
 	require.Equal(t, "https://t.me/$abc", url)
 	require.Equal(t, 1, p.urlCalls)
 }
 
 func TestService_CreateInvoice_PropagatesProviderError(t *testing.T) {
-	p := &stubProvider{urlErr: errors.New("upstream down")}
+	p := &stubProvider{name: "tg_stars", urlErr: errors.New("upstream down")}
 	svc := newService(t, p, newFakeSubs(), &fakeUsers{})
-	_, err := svc.CreateInvoice(context.Background(), 1, PlanPro30d)
+	_, err := svc.CreateInvoice(context.Background(), "tg_stars", 1, PlanPro30d)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invoice url")
+}
+
+func TestService_CreateInvoice_UnknownProvider(t *testing.T) {
+	p := &stubProvider{name: "tg_stars"}
+	svc := newService(t, p, newFakeSubs(), &fakeUsers{})
+	_, err := svc.CreateInvoice(context.Background(), "yookassa", 1, PlanPro30dRUB)
+	require.ErrorIs(t, err, ErrProviderUnknown)
+}
+
+func TestService_DispatchesByProviderName(t *testing.T) {
+	stars := &stubProvider{name: "tg_stars", url: "stars://invoice"}
+	yk := &stubProvider{name: "yookassa", url: "https://yk/checkout/x"}
+	svc := NewService(Deps{
+		Providers: map[string]Provider{"tg_stars": stars, "yookassa": yk},
+		Subs:      newFakeSubs(),
+		Users:     &fakeUsers{},
+	})
+
+	url, err := svc.CreateInvoice(context.Background(), "yookassa", 4242, PlanPro30dRUB)
+	require.NoError(t, err)
+	require.Equal(t, "https://yk/checkout/x", url)
+	require.Equal(t, 1, yk.urlCalls)
+	require.Equal(t, 0, stars.urlCalls)
+}
+
+func TestService_Settle_DispatchesByProviderName(t *testing.T) {
+	stars := &stubProvider{name: "tg_stars", act: Activation{
+		UserID: 100, ProviderRef: "stars-ref", Plan: PlanPro30d, Duration: Duration30d,
+	}}
+	yk := &stubProvider{name: "yookassa", act: Activation{
+		UserID: 200, ProviderRef: "yk-ref", Plan: PlanPro30dRUB, Duration: Duration30d,
+		PaymentMethodID: "pm-1",
+	}}
+	subs := newFakeSubs()
+	users := &fakeUsers{}
+	svc := NewService(Deps{
+		Providers: map[string]Provider{"tg_stars": stars, "yookassa": yk},
+		Subs:      subs,
+		Users:     users,
+		Now:       func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
+	})
+	granted, err := svc.Settle(context.Background(), "yookassa", []byte("{}"))
+	require.NoError(t, err)
+	require.True(t, granted)
+	require.Equal(t, 1, yk.actCalls)
+	require.Equal(t, 0, stars.actCalls)
+	require.Len(t, subs.byRef, 1)
+}
+
+func TestService_Settle_UnknownProvider(t *testing.T) {
+	svc := newService(t, &stubProvider{name: "tg_stars"}, newFakeSubs(), &fakeUsers{})
+	_, err := svc.Settle(context.Background(), "yookassa", []byte("{}"))
+	require.ErrorIs(t, err, ErrProviderUnknown)
 }
 
 func TestService_Settle_NewWebhook_GrantsPro(t *testing.T) {
@@ -137,7 +190,7 @@ func TestService_Settle_NewWebhook_GrantsPro(t *testing.T) {
 	users := &fakeUsers{}
 	svc := newService(t, p, subs, users)
 
-	granted, err := svc.Settle(context.Background(), []byte("{}"))
+	granted, err := svc.Settle(context.Background(), "tg_stars", []byte("{}"))
 	require.NoError(t, err)
 	require.True(t, granted)
 	require.Equal(t, 1, p.actCalls)
@@ -158,11 +211,11 @@ func TestService_Settle_DuplicateWebhook_NoSecondGrant(t *testing.T) {
 	users := &fakeUsers{}
 	svc := newService(t, p, subs, users)
 
-	granted1, err := svc.Settle(context.Background(), []byte("{}"))
+	granted1, err := svc.Settle(context.Background(), "tg_stars", []byte("{}"))
 	require.NoError(t, err)
 	require.True(t, granted1)
 
-	granted2, err := svc.Settle(context.Background(), []byte("{}"))
+	granted2, err := svc.Settle(context.Background(), "tg_stars", []byte("{}"))
 	require.NoError(t, err)
 	require.False(t, granted2, "second webhook with same ref must return granted=false")
 
@@ -187,7 +240,7 @@ func TestService_Settle_DuplicateWebhook_CatchUp(t *testing.T) {
 	subs.nextID = 7
 	svc := newService(t, p, subs, users)
 
-	granted, err := svc.Settle(context.Background(), []byte("{}"))
+	granted, err := svc.Settle(context.Background(), "tg_stars", []byte("{}"))
 	require.NoError(t, err)
 	require.True(t, granted, "catch-up must still report granted=true")
 	require.Equal(t, 1, users.grantCalls, "GrantPro fires once on catch-up")
@@ -200,7 +253,7 @@ func TestService_Settle_HandlePaymentError_NoSideEffects(t *testing.T) {
 	users := &fakeUsers{}
 	svc := newService(t, p, subs, users)
 
-	_, err := svc.Settle(context.Background(), []byte("{}"))
+	_, err := svc.Settle(context.Background(), "tg_stars", []byte("{}"))
 	require.Error(t, err)
 	require.Equal(t, 0, subs.calls)
 	require.Equal(t, 0, users.grantCalls)
@@ -212,7 +265,7 @@ func TestService_Settle_UserResolveError_NoPersist(t *testing.T) {
 	users := &fakeUsers{resolveErr: errors.New("db down")}
 	svc := newService(t, p, subs, users)
 
-	_, err := svc.Settle(context.Background(), []byte("{}"))
+	_, err := svc.Settle(context.Background(), "tg_stars", []byte("{}"))
 	require.Error(t, err)
 	require.Equal(t, 0, subs.calls)
 	require.Equal(t, 0, users.grantCalls)
@@ -225,7 +278,7 @@ func TestService_Settle_SubsInsertError_NoGrant(t *testing.T) {
 	users := &fakeUsers{}
 	svc := newService(t, p, subs, users)
 
-	_, err := svc.Settle(context.Background(), []byte("{}"))
+	_, err := svc.Settle(context.Background(), "tg_stars", []byte("{}"))
 	require.Error(t, err)
 	require.Equal(t, 0, users.grantCalls)
 }
@@ -236,7 +289,7 @@ func TestService_Settle_GrantProError_PropagatesAfterPersist(t *testing.T) {
 	users := &fakeUsers{grantErr: errors.New("db lock")}
 	svc := newService(t, p, subs, users)
 
-	granted, err := svc.Settle(context.Background(), []byte("{}"))
+	granted, err := svc.Settle(context.Background(), "tg_stars", []byte("{}"))
 	require.Error(t, err)
 	require.False(t, granted)
 	// Subscription was already persisted; orchestrator returns the error so

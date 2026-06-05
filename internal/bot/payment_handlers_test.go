@@ -27,13 +27,15 @@ func (f *fakeAcker) AnswerPreCheckoutQuery(_ context.Context, p *tgbot.AnswerPre
 
 // fakeSettler records raw Settle payloads and lets each test pin granted/err.
 type fakeSettler struct {
-	granted bool
-	err     error
-	calls   [][]byte
+	granted      bool
+	err          error
+	calls        [][]byte
+	lastProvider string
 }
 
-func (f *fakeSettler) Settle(_ context.Context, raw []byte) (bool, error) {
+func (f *fakeSettler) Settle(_ context.Context, provider string, raw []byte) (bool, error) {
 	f.calls = append(f.calls, raw)
+	f.lastProvider = provider
 	return f.granted, f.err
 }
 

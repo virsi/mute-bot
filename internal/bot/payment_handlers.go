@@ -10,9 +10,12 @@ import (
 )
 
 // Settler is the surface PaymentHandlers calls into on successful_payment.
-// Satisfied by *billing.Service in production.
+// Satisfied by *billing.Service in production. The provider arg keys
+// dispatch to the right Provider instance — PaymentHandlers always
+// passes "tg_stars" because Telegram successful_payment updates can only
+// originate from the Stars channel in this bot.
 type Settler interface {
-	Settle(ctx context.Context, raw []byte) (bool, error)
+	Settle(ctx context.Context, provider string, raw []byte) (bool, error)
 }
 
 // PreCheckoutAcker abstracts the Bot API call that answers a
@@ -106,7 +109,7 @@ func (p *PaymentHandlers) HandleSuccessfulPayment(ctx context.Context, u *models
 		}
 		return
 	}
-	granted, err := p.settler.Settle(ctx, raw)
+	granted, err := p.settler.Settle(ctx, "tg_stars", raw)
 	if err != nil {
 		p.logger.ErrorContext(ctx, "settle payment",
 			slog.Int64("tg_user_id", u.Message.From.ID),
