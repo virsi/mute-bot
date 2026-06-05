@@ -159,6 +159,57 @@ func (r *ClustersRepo) Snapshot(ctx context.Context, id int64) (Snapshot, error)
 	return s, nil
 }
 
+// TopByScoreSince returns up to limit active clusters whose last_updated_at
+// is >= since, score-descending. Empty topics means "no topic filter"
+// (used when the user has no preset topic list); non-empty topics is
+// applied as a set overlap.
+//
+// excludeIDs supports anti-repeat at the call site: pass cluster ids the
+// user has already seen in earlier weekly digests within the same look-
+// back so they do not re-appear at the top.
+func (r *ClustersRepo) TopByScoreSince(
+	ctx context.Context, since time.Time, topics []string,
+	excludeIDs []int64, limit int,
+) ([]Cluster, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if excludeIDs == nil {
+		excludeIDs = []int64{}
+	}
+	if topics == nil {
+		topics = []string{}
+	}
+	const q = `
+		SELECT id, headline, summary, topics, severity, coverage, score,
+		       first_seen_at, last_updated_at, status
+		  FROM clusters
+		 WHERE status = 'active'
+		   AND last_updated_at >= $1
+		   AND ($2::text[] = '{}'::text[] OR topics && $2::text[])
+		   AND NOT (id = ANY($3::bigint[]))
+		 ORDER BY score DESC, last_updated_at DESC
+		 LIMIT $4`
+	rows, err := r.p.Pool().Query(ctx, q, since, topics, excludeIDs, limit)
+	if err != nil {
+		return nil, fmt.Errorf("top by score: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Cluster, 0, limit)
+	for rows.Next() {
+		var c Cluster
+		if err := rows.Scan(&c.ID, &c.Headline, &c.Summary, &c.Topics, &c.Severity,
+			&c.Coverage, &c.Score, &c.FirstSeenAt, &c.LastUpdatedAt, &c.Status); err != nil {
+			return nil, fmt.Errorf("scan cluster: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows err: %w", err)
+	}
+	return out, nil
+}
+
 // Search returns active clusters matching the filter, score-descending.
 // Topics is matched as set overlap (&&). Empty ExcludeIDs is fine — the
 // generated empty bigint[] simply matches nothing.
