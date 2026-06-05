@@ -82,6 +82,65 @@ nats_url: "x"
 	require.ErrorContains(t, err, "NOT_SET_ANYWHERE")
 }
 
+func TestLoad_YooKassaEnvOverrides(t *testing.T) {
+	t.Setenv("MUTE_YOOKASSA_SHOP_ID", "12345")
+	t.Setenv("MUTE_YOOKASSA_SECRET_KEY", "test-secret")
+	t.Setenv("MUTE_YOOKASSA_WEBHOOK_SECRET", "hmac-secret")
+	t.Setenv("MUTE_BASE_EXTERNAL_URL", "https://bot.example.com")
+	t.Setenv("MUTE_YOOKASSA_RETURN_URL", "https://t.me/mute_bot")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+postgres_dsn: "postgres://x"
+redis_addr: "x"
+nats_url: "x"
+`), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, "12345", cfg.YooKassa.ShopID)
+	require.Equal(t, "test-secret", cfg.YooKassa.SecretKey)
+	require.Equal(t, "hmac-secret", cfg.YooKassa.WebhookSecret)
+	require.Equal(t, "https://bot.example.com", cfg.BaseExternalURL)
+	require.Equal(t, "https://t.me/mute_bot", cfg.YooKassa.ReturnURL)
+}
+
+func TestLoad_YooKassaOptional(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+postgres_dsn: "postgres://x"
+redis_addr: "x"
+nats_url: "x"
+`), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	require.Empty(t, cfg.YooKassa.ShopID)
+	require.Empty(t, cfg.BaseExternalURL)
+}
+
+func TestLoad_YooKassaFromYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+postgres_dsn: "postgres://x"
+redis_addr: "x"
+nats_url: "x"
+base_external_url: "https://api.mute.dev"
+yookassa:
+  shop_id: "yaml-shop"
+  secret_key: "yaml-secret"
+  webhook_secret: "yaml-hmac"
+  return_url: "https://t.me/mute_bot"
+`), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, "yaml-shop", cfg.YooKassa.ShopID)
+	require.Equal(t, "yaml-secret", cfg.YooKassa.SecretKey)
+	require.Equal(t, "yaml-hmac", cfg.YooKassa.WebhookSecret)
+	require.Equal(t, "https://t.me/mute_bot", cfg.YooKassa.ReturnURL)
+	require.Equal(t, "https://api.mute.dev", cfg.BaseExternalURL)
+}
+
 func TestLoad_EnvSubst_NonMatchingPatternUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "c.yaml")

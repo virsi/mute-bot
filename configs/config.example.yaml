@@ -13,3 +13,13 @@ llm:
   monthly_budget_usd: 50
   embedding_model: "text-embedding-3-small"
   classifier_model: "gpt-4o-mini"
+
+# Public HTTPS origin of the bot-api process. Used to compose the YooKassa
+# webhook URL. Leave empty when YooKassa is not configured.
+base_external_url: ""
+
+yookassa:
+  shop_id: ""          # YooKassa shop id
+  secret_key: ""       # YooKassa API secret key
+  webhook_secret: ""   # HMAC SHA256 secret for the /yookassa/webhook endpoint
+  return_url: ""       # Deeplink to redirect after payment, e.g. https://t.me/<bot>

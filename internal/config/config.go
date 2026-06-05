@@ -23,6 +23,35 @@ type Config struct {
 	OTLPEndpoint string  `yaml:"otlp_endpoint"`
 	MTProto      MTProto `yaml:"mtproto"`
 	LLM          LLM     `yaml:"llm"`
+
+	// BaseExternalURL is the public HTTPS origin the bot-api process is
+	// reachable at (e.g. "https://bot.example.com"). YooKassa needs an
+	// absolute URL to POST notifications to; cmd/bot-api composes
+	// BaseExternalURL + "/yookassa/webhook" when registering payments.
+	// Optional — empty disables the YooKassa provider entirely.
+	BaseExternalURL string `yaml:"base_external_url"`
+
+	// YooKassa groups the API credentials and HMAC secret for the YooKassa
+	// payment provider. Operator-controlled — never committed.
+	YooKassa YooKassa `yaml:"yookassa"`
+}
+
+// YooKassa groups the API credentials and signing secret for the YooKassa
+// payment provider. Empty ShopID disables the provider so a deployment
+// running only Stars still boots.
+type YooKassa struct {
+	// ShopID is the YooKassa shop identifier used as the HTTP Basic auth
+	// username when calling api.yookassa.ru.
+	ShopID string `yaml:"shop_id"`
+	// SecretKey is the YooKassa API secret used as the HTTP Basic auth
+	// password.
+	SecretKey string `yaml:"secret_key"`
+	// WebhookSecret is the HMAC SHA256 key shared with YooKassa for
+	// /yookassa/webhook request authentication.
+	WebhookSecret string `yaml:"webhook_secret"`
+	// ReturnURL is the deeplink YooKassa redirects the user to after the
+	// payment confirmation page. Defaults to https://t.me/ when empty.
+	ReturnURL string `yaml:"return_url"`
 }
 
 // MTProto groups MTProto user-session credentials.
@@ -98,6 +127,14 @@ func applyEnvOverrides(c *Config) {
 		"MUTE_OPENAI_API_KEY":  &c.OpenAIAPIKey,
 		"MUTE_OPENAI_BASE_URL": &c.LLM.BaseURL,
 		"MUTE_OTLP_ENDPOINT":   &c.OTLPEndpoint,
+		// YooKassa credentials may flow in via env so secrets do not have
+		// to live in the committed config.yaml. Empty values keep the
+		// provider disabled.
+		"MUTE_BASE_EXTERNAL_URL":       &c.BaseExternalURL,
+		"MUTE_YOOKASSA_SHOP_ID":        &c.YooKassa.ShopID,
+		"MUTE_YOOKASSA_SECRET_KEY":     &c.YooKassa.SecretKey,
+		"MUTE_YOOKASSA_WEBHOOK_SECRET": &c.YooKassa.WebhookSecret,
+		"MUTE_YOOKASSA_RETURN_URL":     &c.YooKassa.ReturnURL,
 	}
 	for k, p := range overrides {
 		if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
