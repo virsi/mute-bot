@@ -40,6 +40,7 @@ import (
 	"github.com/virsi/mute-bot/internal/storage/postgres"
 	rdb "github.com/virsi/mute-bot/internal/storage/redis"
 	"github.com/virsi/mute-bot/internal/topics"
+	"github.com/virsi/mute-bot/internal/users"
 )
 
 func main() {
@@ -196,6 +197,36 @@ func run() error {
 	})
 	deliveryWorker := digest.NewDeliveryWorker(assembler)
 
+	// Custom-topic matcher shared with bot-api's /topics commands and the
+	// weekly/alert delivery paths. Reusing the same llmClient keeps the
+	// BudgetGuard accounting central.
+	topicsSvc := topics.NewService(topics.Deps{
+		Repo:     postgres.NewUserTopicsRepo(pool),
+		Embedder: llmClient,
+		Model:    cfg.LLM.EmbeddingModel,
+	})
+
+	// Weekly digest wiring: shares the daily assembler's collaborators but
+	// pulls clusters via TopByScoreSince and persists into weekly_deliveries
+	// so the Sunday-18:00 fan-out cannot send twice in one ISO week. The
+	// custom-topic filter is wired with the same topicsSvc/embeddings combo
+	// the daily and alert paths use so Pro users see consistent topic
+	// trimming across all three delivery surfaces.
+	weeklyRepo := postgres.NewWeeklyDeliveriesRepo(pool)
+	usersSvc := users.NewService(users.Deps{Users: usersRepo, Settings: settingsRepo})
+	weeklyAssembler := digest.NewWeeklyAssembler(digest.WeeklyAssemblerDeps{
+		Settings:     settingsRepo,
+		Clusters:     clustersRepo,
+		Weekly:       weeklyRepo,
+		Sources:      channelsRepo,
+		Sender:       sender,
+		Tier:         usersSvc,
+		Users:        usersRepo,
+		CustomTopics: topicsSvc,
+		Centroider:   embeddingsRepo,
+	})
+	weeklyWorker := digest.NewWeeklyWorker(weeklyAssembler)
+
 	// Normalizer. The storage-bound PostsRepoFunc closure keeps the
 	// normalize package free of postgres types: NormalizedPostInsert is
 	// the stable boundary, PostInsert is internal to storage.
@@ -266,20 +297,9 @@ func run() error {
 	}
 
 	// Alerts worker: second durable on cluster.scored alongside rank. The
-	// JetStream consumer name ("alerts") is what isolates the two subscriptions
-	// so each gets its own copy of every cluster.scored message; one stream,
-	// two independent flow-control + ack pipelines.
-	//
-	// The Topics matcher is a pass-through stub until M4's internal/topics
-	// service lands. When M4 wires its real matcher, this single line
-	// changes — the worker contract does not.
-	// Custom-topic matcher shared with bot-api's /topics commands.
-	// Reusing the same llmClient keeps the BudgetGuard accounting central.
-	topicsSvc := topics.NewService(topics.Deps{
-		Repo:     postgres.NewUserTopicsRepo(pool),
-		Embedder: llmClient,
-		Model:    cfg.LLM.EmbeddingModel,
-	})
+	// JetStream consumer name ("alerts") is what isolates the two
+	// subscriptions so each gets its own copy of every cluster.scored
+	// message; one stream, two independent flow-control + ack pipelines.
 	alertThrottle := rdb.NewAlertThrottle(rclient)
 	alertWorker := alerts.NewWorker(alerts.Deps{
 		Users:    alertsUsersAdapter{repo: usersRepo},
@@ -298,6 +318,7 @@ func run() error {
 	consume(queue.StreamClusters, queue.SubjectClusterScored, "rank", rankWorker.Handle)
 	consume(queue.StreamClusters, queue.SubjectClusterScored, "alerts", alertWorker.Handle)
 	consume(queue.StreamDelivery, queue.SubjectDeliverySched, "delivery", deliveryWorker.Handle)
+	consume(queue.StreamDelivery, queue.SubjectDeliveryWeeklySched, "weekly_delivery", weeklyWorker.Handle)
 
 	slog.Info("processor: pipeline running")
 	wg.Wait()
