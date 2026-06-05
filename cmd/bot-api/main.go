@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -178,6 +179,26 @@ func run() error {
 			slog.Error("bot-api: http server error", slog.Any("err", err))
 		}
 	}()
+
+	// YooKassa autopayment renewer. Scans every hour for subscriptions
+	// that expire within 24h and have a saved payment_method_id, then
+	// charges them via /v3/payments — the resulting payment.succeeded
+	// webhook flows back through the same Settle path, granting +30 days
+	// idempotently. Stars users have no saved card so they are skipped
+	// at the SQL level.
+	if ykProvider != nil {
+		renewer := billing.NewYooKassaRenewer(billing.YooKassaRenewerDeps{
+			Renewer:  ykProvider,
+			Subs:     subsRepo,
+			Interval: time.Hour,
+			Window:   24 * time.Hour,
+		})
+		go func() {
+			if err := renewer.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("bot-api: yookassa renewer", slog.Any("err", err))
+			}
+		}()
+	}
 
 	assembler := digest.NewAssembler(digest.AssemblerDeps{
 		Settings:   settings,
