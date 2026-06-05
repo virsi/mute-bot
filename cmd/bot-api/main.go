@@ -24,8 +24,10 @@ import (
 	"github.com/virsi/mute-bot/internal/bot"
 	"github.com/virsi/mute-bot/internal/config"
 	"github.com/virsi/mute-bot/internal/digest"
+	"github.com/virsi/mute-bot/internal/llm"
 	"github.com/virsi/mute-bot/internal/obs"
 	"github.com/virsi/mute-bot/internal/storage/postgres"
+	"github.com/virsi/mute-bot/internal/topics"
 	"github.com/virsi/mute-bot/internal/users"
 )
 
@@ -95,12 +97,30 @@ func run() error {
 	deliveries := postgres.NewDeliveriesRepo(pool)
 	channelsRepo := postgres.NewChannelsRepo(pool)
 	subsRepo := postgres.NewSubscriptionsRepo(pool)
+	userTopicsRepo := postgres.NewUserTopicsRepo(pool)
 
 	// usersSvc unifies /start, billing webhooks (M3) and the expiry sweep
 	// behind one service so the upsert + default-seed flow stays in one
 	// place. It also doubles as the TierChecker for /settings and the
 	// Pro-gate middleware below.
 	usersSvc := users.NewService(users.Deps{Users: usersRepo, Settings: settings})
+
+	// LLM client for the topics.Service AddTopic embedding call. The
+	// budget guard is shared with the processor's pipeline so the
+	// monthly cap covers both the dedup embedder and the user-topic
+	// embedder. INV-5: embed is paid once per /topics add — never per
+	// digest assembly (the digest filter only does cosine math in SQL).
+	llmBudget := llm.NewBudgetGuard(llm.BudgetConfig{MonthlyUSD: cfg.LLM.MonthlyBudgetUSD})
+	llmClient := llm.NewOpenAI(llm.OpenAIConfig{
+		APIKey:  cfg.OpenAIAPIKey,
+		BaseURL: cfg.LLM.BaseURL,
+		Budget:  llmBudget,
+	})
+	topicsSvc := topics.NewService(topics.Deps{
+		Repo:     userTopicsRepo,
+		Embedder: llmClient,
+		Model:    cfg.LLM.EmbeddingModel,
+	})
 
 	// Billing wiring: StarsProvider over the live Bot API + Service over
 	// (provider, subsRepo, usersSvc). Service.Settle is the idempotent
@@ -145,6 +165,7 @@ func run() error {
 		Tier:      usersSvc,
 		Invoicer:  billingSvc,
 		ButtonAPI: &client.SendOnly,
+		Topics:    topicsSvc,
 	})
 
 	registerHandlers(client.Bot(), h, usersSvc, &client.SendOnly)
@@ -259,8 +280,72 @@ func registerHandlers(b *tgbot.Bot, h *bot.Handlers, reg bot.Registrar, sender b
 				}
 				return
 			}
-			if err := h.HandleToggleTopic(ctx, u.Message.From.ID, u.Message.From.Username, parts[1]); err != nil {
-				slog.Error("/topics failed", slog.Any("err", err))
+			// M4 sub-commands are Pro-only: /topics add|remove|list. Each
+			// path resolves the user via Registrar (idempotent), checks
+			// tier inline, and either delegates to the Handle* method or
+			// replies with the upgrade message. The legacy preset toggle
+			// — /topics <ID> — stays Free-accessible to preserve the
+			// Phase-1 contract.
+			tgUserID := u.Message.From.ID
+			tgUsername := u.Message.From.Username
+			sub := strings.ToLower(parts[1])
+			switch sub {
+			case "add", "remove":
+				if len(parts) < 3 {
+					if err := sender.Send(ctx, tgUserID,
+						"Использование: /topics "+sub+" <название>"); err != nil {
+						slog.Error("/topics usage hint", slog.Any("err", err))
+					}
+					return
+				}
+				name := strings.Join(parts[2:], " ")
+				gate := func(next func(context.Context, int64, string) error, logTag string) {
+					ru, _, err := reg.RegisterOnStart(ctx, tgUserID, tgUsername)
+					if err != nil {
+						slog.Error(logTag+" resolve user", slog.Any("err", err))
+						return
+					}
+					if tier == nil || !tier.IsPro(ru) {
+						if err := sender.Send(ctx, tgUserID,
+							"Эта команда доступна в Pro-подписке. Используй /buy"); err != nil {
+							slog.Error(logTag+" gate reply", slog.Any("err", err))
+						}
+						return
+					}
+					if err := next(ctx, tgUserID, tgUsername); err != nil {
+						slog.Error(logTag+" failed", slog.Any("err", err))
+					}
+				}
+				if sub == "add" {
+					gate(func(c context.Context, tg int64, un string) error {
+						return h.HandleTopicsAdd(c, tg, un, name)
+					}, "/topics add")
+				} else {
+					gate(func(c context.Context, tg int64, un string) error {
+						return h.HandleTopicsRemove(c, tg, un, name)
+					}, "/topics remove")
+				}
+			case "list":
+				ru, _, err := reg.RegisterOnStart(ctx, tgUserID, tgUsername)
+				if err != nil {
+					slog.Error("/topics list resolve user", slog.Any("err", err))
+					return
+				}
+				if tier == nil || !tier.IsPro(ru) {
+					if err := sender.Send(ctx, tgUserID,
+						"Эта команда доступна в Pro-подписке. Используй /buy"); err != nil {
+						slog.Error("/topics list gate reply", slog.Any("err", err))
+					}
+					return
+				}
+				if err := h.HandleTopicsList(ctx, tgUserID, tgUsername); err != nil {
+					slog.Error("/topics list failed", slog.Any("err", err))
+				}
+			default:
+				// Legacy preset toggle: /topics <ID> (e.g. /topics politics).
+				if err := h.HandleToggleTopic(ctx, tgUserID, tgUsername, parts[1]); err != nil {
+					slog.Error("/topics failed", slog.Any("err", err))
+				}
 			}
 		},
 	)

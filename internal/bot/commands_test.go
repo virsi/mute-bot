@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/virsi/mute-bot/internal/storage/postgres"
+	"github.com/virsi/mute-bot/internal/topics"
 )
 
 // fakeRegistrarRecorder stubs the Registrar port for HandleStart tests
@@ -567,6 +568,167 @@ func TestAlerts_UnknownSubcommand(t *testing.T) {
 	require.Equal(t, postgres.SettingsUpdate{}, st.stored, "unknown subcommand must not write")
 	require.Len(t, send.msgs, 1)
 }
+
+// --- /topics add|remove|list (M4) ---
+
+// fakeTopicsService stubs the TopicsService interface so HandleTopicsAdd/
+// Remove/List can be exercised without a real embedder or pgvector. The
+// addErr field lets a test simulate ErrTooManyTopics / ErrEmptyName /
+// other failures.
+type fakeTopicsService struct {
+	addCalls    int
+	addUserID   int64
+	addName     string
+	addErr      error
+	removeCalls int
+	removeName  string
+	removeErr   error
+	listResult  []string
+	listErr     error
+}
+
+func (f *fakeTopicsService) AddTopic(_ context.Context, userID int64, name string) error {
+	f.addCalls++
+	f.addUserID = userID
+	f.addName = name
+	return f.addErr
+}
+
+func (f *fakeTopicsService) RemoveTopic(_ context.Context, _ int64, name string) error {
+	f.removeCalls++
+	f.removeName = name
+	return f.removeErr
+}
+
+func (f *fakeTopicsService) ListTopics(_ context.Context, _ int64) ([]string, error) {
+	return f.listResult, f.listErr
+}
+
+func TestHandleTopicsAdd_PersistsAndConfirms(t *testing.T) {
+	send := &capturedSender{}
+	ts := &fakeTopicsService{}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send, Topics: ts,
+	})
+
+	require.NoError(t, h.HandleTopicsAdd(context.Background(), 555, "alice", "ai-news"))
+	require.Equal(t, 1, ts.addCalls)
+	require.Equal(t, int64(1), ts.addUserID)
+	require.Equal(t, "ai-news", ts.addName)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "ai-news")
+}
+
+func TestHandleTopicsAdd_LimitReached_FriendlyMessage(t *testing.T) {
+	send := &capturedSender{}
+	ts := &fakeTopicsService{addErr: topics.ErrTooManyTopics}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send, Topics: ts,
+	})
+
+	require.NoError(t, h.HandleTopicsAdd(context.Background(), 555, "alice", "overflow"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "Лимит")
+}
+
+func TestHandleTopicsAdd_EmptyName_FriendlyMessage(t *testing.T) {
+	send := &capturedSender{}
+	ts := &fakeTopicsService{addErr: topics.ErrEmptyName}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send, Topics: ts,
+	})
+
+	require.NoError(t, h.HandleTopicsAdd(context.Background(), 555, "alice", "  "))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "пустым")
+}
+
+func TestHandleTopicsAdd_NoServiceWired_StubReply(t *testing.T) {
+	send := &capturedSender{}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send})
+
+	require.NoError(t, h.HandleTopicsAdd(context.Background(), 555, "alice", "ai"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "скоро")
+}
+
+func TestHandleTopicsRemove_DelegatesAndConfirms(t *testing.T) {
+	send := &capturedSender{}
+	ts := &fakeTopicsService{}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send, Topics: ts,
+	})
+
+	require.NoError(t, h.HandleTopicsRemove(context.Background(), 555, "alice", "crypto"))
+	require.Equal(t, 1, ts.removeCalls)
+	require.Equal(t, "crypto", ts.removeName)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "crypto")
+}
+
+func TestHandleTopicsList_ShowsNames(t *testing.T) {
+	send := &capturedSender{}
+	ts := &fakeTopicsService{listResult: []string{"ai", "crypto"}}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send, Topics: ts,
+	})
+
+	require.NoError(t, h.HandleTopicsList(context.Background(), 555, "alice"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "ai")
+	require.Contains(t, send.msgs[0], "crypto")
+}
+
+func TestHandleTopicsList_EmptyShowsHint(t *testing.T) {
+	send := &capturedSender{}
+	ts := &fakeTopicsService{listResult: nil}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send, Topics: ts,
+	})
+
+	require.NoError(t, h.HandleTopicsList(context.Background(), 555, "alice"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "/topics add")
+}
+
+// TestRequirePro_TopicsAdd_FreeDenied confirms the Pro gate stops a
+// Free user before the topics service is touched. This is the contract
+// the bot-api wiring relies on.
+func TestRequirePro_TopicsAdd_FreeDenied(t *testing.T) {
+	send := &capturedSender{}
+	ts := &fakeTopicsService{}
+	reg := &fakeRegistrarRecorder{}
+	tier := &stubTierChecker{pro: false}
+
+	gated := RequirePro(reg, tier, send, func(_ context.Context, _ int64, _ string) error {
+		ts.addCalls++
+		return nil
+	})
+	require.NoError(t, gated(context.Background(), 555, "alice"))
+	require.Equal(t, 0, ts.addCalls, "Free user must not reach the topics service")
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "Pro")
+}
+
+func TestRequirePro_TopicsAdd_ProAllowed(t *testing.T) {
+	send := &capturedSender{}
+	reg := &fakeRegistrarRecorder{}
+	tier := &stubTierChecker{pro: true}
+	called := false
+
+	gated := RequirePro(reg, tier, send, func(_ context.Context, _ int64, _ string) error {
+		called = true
+		return nil
+	})
+	require.NoError(t, gated(context.Background(), 555, "alice"))
+	require.True(t, called, "Pro user must reach next")
+	require.Empty(t, send.msgs, "Pro path must not send the gate reply")
+}
+
+// stubTierChecker is a tiny TierChecker fake for the middleware tests.
+type stubTierChecker struct{ pro bool }
+
+func (s *stubTierChecker) IsPro(_ postgres.User) bool { return s.pro }
 
 func TestAssemblerFunc_AdaptsFunc(t *testing.T) {
 	called := false
