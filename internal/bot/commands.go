@@ -49,6 +49,25 @@ type AssemblerIface interface {
 	Assemble(ctx context.Context, req AssembleReq) error
 }
 
+// WeeklyAssemblerIface is the slice of digest.WeeklyAssembler the /weekly
+// handler needs. cmd/bot-api wires *digest.WeeklyAssembler directly via
+// WeeklyAssemblerFunc so the bot package keeps the WeeklyRequest type out
+// of its imports.
+type WeeklyAssemblerIface interface {
+	BuildWeekly(ctx context.Context, userID, tgUserID int64) error
+}
+
+// WeeklyAssemblerFunc adapts a closure to WeeklyAssemblerIface.
+type WeeklyAssemblerFunc func(ctx context.Context, userID, tgUserID int64) error
+
+// BuildWeekly calls f.
+func (f WeeklyAssemblerFunc) BuildWeekly(ctx context.Context, u, tg int64) error {
+	return f(ctx, u, tg)
+}
+
+// Compile-time guarantee the func adapter satisfies the interface.
+var _ WeeklyAssemblerIface = WeeklyAssemblerFunc(nil)
+
 // AssemblerFunc adapts a function to AssemblerIface so cmd/bot-api can
 // supply an inline closure that translates AssembleReq into the digest
 // package's own request type.
@@ -124,6 +143,10 @@ type HandlersDeps struct {
 	Invoicer  Invoicer
 	ButtonAPI URLButtonSender
 	Topics    TopicsService
+	// Weekly is the on-demand weekly digest assembler used by /weekly.
+	// Nil-safe — when unwired the handler falls back to a friendly stub
+	// message so unit tests can exercise the file without M1 plumbing.
+	Weekly WeeklyAssemblerIface
 }
 
 // Handlers groups the per-command methods. One method per slash command;
@@ -341,11 +364,87 @@ func (h *Handlers) HandleSettings(ctx context.Context, tgUserID int64, username 
 	if u.Tier == "pro" && u.TierUntil != nil {
 		tierLine += fmt.Sprintf(" (до %s)", u.TierUntil.Format("02 Jan 2006"))
 	}
+	weeklyState := "выкл"
+	if s.WeeklyEnabled {
+		weeklyState = "вкл"
+	}
 	text := fmt.Sprintf(
-		"Настройки:\n\nТемы: %v\nПорог: %d\nРасписание: %s\n%s",
-		s.Topics, s.Threshold, string(s.ScheduleJSON), tierLine,
+		"Настройки:\n\nТемы: %v\nПорог: %d\nРасписание: %s\nЕженедельный дайджест: %s\n%s",
+		s.Topics, s.Threshold, string(s.ScheduleJSON), weeklyState, tierLine,
 	)
 	return h.d.API.Send(ctx, tgUserID, text)
+}
+
+// HandleWeekly implements the on-demand /weekly command. Pro-only — the
+// gate is applied by the wiring layer (RequirePro middleware). On-demand
+// /weekly intentionally bypasses the once-per-ISO-week anti-repeat so a
+// Pro user can re-pull the digest on demand; the assembler is configured
+// with SkipAntiRepeat=true in cmd/bot-api so this handler does not need
+// any special-casing.
+func (h *Handlers) HandleWeekly(ctx context.Context, tgUserID int64, username string) error {
+	if h.d.Weekly == nil {
+		return h.d.API.Send(ctx, tgUserID, "Недельная сводка скоро будет доступна.")
+	}
+	u, _, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
+	if err != nil {
+		return fmt.Errorf("get_or_create user: %w", err)
+	}
+	if err := h.d.Weekly.BuildWeekly(ctx, u.ID, tgUserID); err != nil {
+		return fmt.Errorf("build weekly: %w", err)
+	}
+	return nil
+}
+
+// HandleWeeklySettings implements /weekly_settings on|off. Pro-only via
+// the wiring layer. Toggles user_settings.weekly_enabled; the scheduler
+// loader picks up the change on its next reload tick so the cron starts
+// or stops emitting Sunday-18:00 jobs for the user without any process
+// restart.
+//
+// No argument → echo the current state. Unknown argument → usage hint.
+func (h *Handlers) HandleWeeklySettings(ctx context.Context, tgUserID int64, username string, args []string) error {
+	u, _, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
+	if err != nil {
+		return fmt.Errorf("get_or_create user: %w", err)
+	}
+	s, err := h.d.Settings.Get(ctx, u.ID)
+	if err != nil {
+		return fmt.Errorf("get settings: %w", err)
+	}
+	if len(args) == 0 {
+		state := "выключен"
+		if s.WeeklyEnabled {
+			state = "включён"
+		}
+		return h.d.API.Send(ctx, tgUserID,
+			fmt.Sprintf("Еженедельный дайджест: %s. Использование: /weekly_settings on|off", state))
+	}
+	upd := postgres.SettingsUpdate{
+		Topics:           s.Topics,
+		Threshold:        s.Threshold,
+		ScheduleJSON:     s.ScheduleJSON,
+		AlertsEnabled:    s.AlertsEnabled,
+		AlertThreshold:   s.AlertThreshold,
+		AlertThrottleMin: s.AlertThrottleMin,
+		WeeklyEnabled:    s.WeeklyEnabled,
+	}
+	switch strings.ToLower(args[0]) {
+	case "on":
+		upd.WeeklyEnabled = true
+	case "off":
+		upd.WeeklyEnabled = false
+	default:
+		return h.d.API.Send(ctx, tgUserID, "Использование: /weekly_settings on|off")
+	}
+	if err := h.d.Settings.Upsert(ctx, u.ID, upd); err != nil {
+		return fmt.Errorf("upsert settings: %w", err)
+	}
+	state := "выключен"
+	if upd.WeeklyEnabled {
+		state = "включён"
+	}
+	return h.d.API.Send(ctx, tgUserID,
+		fmt.Sprintf("Еженедельный дайджест %s.", state))
 }
 
 // HandleBuy implements /buy. When the Invoicer and ButtonAPI collaborators

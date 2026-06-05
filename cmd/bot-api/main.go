@@ -156,6 +156,28 @@ func run() error {
 		})
 	})
 
+	// Weekly digest wiring: shares the daily collaborators but uses its
+	// own TopByScoreSince + anti-repeat repo. On-demand /weekly bypasses
+	// the once-per-week guard (SkipAntiRepeat=true) so a Pro user can
+	// re-pull the digest as many times as they want without colliding
+	// with the Sunday cron path.
+	weeklyRepoBA := postgres.NewWeeklyDeliveriesRepo(pool)
+	weeklyAssembler := digest.NewWeeklyAssembler(digest.WeeklyAssemblerDeps{
+		Settings:       settings,
+		Clusters:       clusters,
+		Weekly:         weeklyRepoBA,
+		Sources:        channelsRepo,
+		Sender:         sender,
+		Tier:           usersSvc,
+		Users:          usersRepo,
+		CustomTopics:   topicsSvc,
+		Centroider:     postgres.NewEmbeddingsRepo(pool),
+		SkipAntiRepeat: true,
+	})
+	weeklyAdapter := bot.WeeklyAssemblerFunc(func(ctx context.Context, u, tg int64) error {
+		return weeklyAssembler.BuildWeekly(ctx, digest.WeeklyRequest{UserID: u, TGUserID: tg})
+	})
+
 	h := bot.NewHandlers(bot.HandlersDeps{
 		Users:     usersRepo,
 		Settings:  settings,
@@ -166,6 +188,7 @@ func run() error {
 		Invoicer:  billingSvc,
 		ButtonAPI: &client.SendOnly,
 		Topics:    topicsSvc,
+		Weekly:    weeklyAdapter,
 	})
 
 	registerHandlers(client.Bot(), h, usersSvc, &client.SendOnly)
@@ -359,6 +382,68 @@ func registerHandlers(b *tgbot.Bot, h *bot.Handlers, reg bot.Registrar, sender b
 			}
 			if err := h.HandleBuy(ctx, u.Message.From.ID, u.Message.From.Username); err != nil {
 				slog.Error("/buy failed", slog.Any("err", err))
+			}
+		},
+	)
+
+	// /weekly is Pro-only. Same gate shape as /alerts: resolve via the
+	// Registrar so a brand-new Pro purchaser can hit /weekly right after
+	// /start without needing a separate row-creation step.
+	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/weekly", tgbot.MatchTypePrefix,
+		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
+			if u.Message == nil || u.Message.From == nil {
+				return
+			}
+			// Reject /weekly_settings here so the prefix matcher does not
+			// dispatch the settings command to the weekly handler. The
+			// /weekly_settings handler runs immediately below.
+			if strings.HasPrefix(u.Message.Text, "/weekly_settings") {
+				return
+			}
+			ru, _, err := reg.RegisterOnStart(ctx, u.Message.From.ID, u.Message.From.Username)
+			if err != nil {
+				slog.Error("/weekly resolve user", slog.Any("err", err))
+				return
+			}
+			if tier == nil || !tier.IsPro(ru) {
+				if err := sender.Send(ctx, u.Message.From.ID,
+					"Эта команда доступна в Pro-подписке. Используй /buy"); err != nil {
+					slog.Error("/weekly gate reply", slog.Any("err", err))
+				}
+				return
+			}
+			if err := h.HandleWeekly(ctx, u.Message.From.ID, u.Message.From.Username); err != nil {
+				slog.Error("/weekly failed", slog.Any("err", err))
+			}
+		},
+	)
+
+	// /weekly_settings on|off is Pro-only — Free users cannot enable the
+	// weekly cron in the first place. Mirrors the /alerts gate.
+	b.RegisterHandler(tgbot.HandlerTypeMessageText, "/weekly_settings", tgbot.MatchTypePrefix,
+		func(ctx context.Context, _ *tgbot.Bot, u *models.Update) {
+			if u.Message == nil || u.Message.From == nil {
+				return
+			}
+			ru, _, err := reg.RegisterOnStart(ctx, u.Message.From.ID, u.Message.From.Username)
+			if err != nil {
+				slog.Error("/weekly_settings resolve user", slog.Any("err", err))
+				return
+			}
+			if tier == nil || !tier.IsPro(ru) {
+				if err := sender.Send(ctx, u.Message.From.ID,
+					"Эта команда доступна в Pro-подписке. Используй /buy"); err != nil {
+					slog.Error("/weekly_settings gate reply", slog.Any("err", err))
+				}
+				return
+			}
+			parts := strings.Fields(u.Message.Text)
+			var args []string
+			if len(parts) > 1 {
+				args = parts[1:]
+			}
+			if err := h.HandleWeeklySettings(ctx, u.Message.From.ID, u.Message.From.Username, args); err != nil {
+				slog.Error("/weekly_settings failed", slog.Any("err", err))
 			}
 		},
 	)

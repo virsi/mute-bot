@@ -730,6 +730,118 @@ type stubTierChecker struct{ pro bool }
 
 func (s *stubTierChecker) IsPro(_ postgres.User) bool { return s.pro }
 
+// fakeWeekly stubs WeeklyAssemblerIface. Captures the user id / tg id so
+// HandleWeekly tests can assert dispatch happened with the resolved
+// internal id (not the raw tg id).
+type fakeWeekly struct {
+	called bool
+	userID int64
+	tg     int64
+	err    error
+}
+
+func (f *fakeWeekly) BuildWeekly(_ context.Context, u, tg int64) error {
+	f.called = true
+	f.userID = u
+	f.tg = tg
+	return f.err
+}
+
+func TestHandleWeekly_DelegatesToAssembler(t *testing.T) {
+	send := &capturedSender{}
+	weekly := &fakeWeekly{}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send, Weekly: weekly})
+
+	require.NoError(t, h.HandleWeekly(context.Background(), 555, "alice"))
+	require.True(t, weekly.called)
+	require.Equal(t, int64(1), weekly.userID, "must pass resolved internal users.id")
+	require.Equal(t, int64(555), weekly.tg)
+}
+
+func TestHandleWeekly_NilAssembler_FriendlyStub(t *testing.T) {
+	send := &capturedSender{}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: &fakeSettings{}, API: send})
+
+	require.NoError(t, h.HandleWeekly(context.Background(), 555, "alice"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "скоро")
+}
+
+func TestHandleWeeklySettings_NoArgs_ShowsState(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{WeeklyEnabled: true}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleWeeklySettings(context.Background(), 555, "alice", nil))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "включён")
+}
+
+func TestHandleWeeklySettings_On_SetsFlag(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{
+		Topics: []string{"politics"}, Threshold: 50, WeeklyEnabled: false,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleWeeklySettings(context.Background(), 555, "alice", []string{"on"}))
+	require.True(t, st.stored.WeeklyEnabled)
+	// Other fields preserved.
+	require.Equal(t, []string{"politics"}, st.stored.Topics)
+	require.Equal(t, 50, st.stored.Threshold)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "включён")
+}
+
+func TestHandleWeeklySettings_Off_ClearsFlag(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{WeeklyEnabled: true}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleWeeklySettings(context.Background(), 555, "alice", []string{"off"}))
+	require.False(t, st.stored.WeeklyEnabled)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "выключен")
+}
+
+func TestHandleWeeklySettings_UnknownArg(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleWeeklySettings(context.Background(), 555, "alice", []string{"maybe"}))
+	require.Equal(t, postgres.SettingsUpdate{}, st.stored, "unknown arg must not write")
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "Использование")
+}
+
+func TestHandleSettings_ShowsWeeklyState(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeSettings{get: postgres.Settings{
+		Topics:        []string{"politics"},
+		Threshold:     50,
+		ScheduleJSON:  json.RawMessage(`{}`),
+		WeeklyEnabled: true,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleSettings(context.Background(), 555, "alice"))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "Еженедельный дайджест: вкл")
+}
+
+func TestWeeklyAssemblerFunc_AdaptsFunc(t *testing.T) {
+	called := false
+	var f WeeklyAssemblerFunc = func(_ context.Context, u, tg int64) error {
+		called = true
+		require.Equal(t, int64(1), u)
+		require.Equal(t, int64(100), tg)
+		return nil
+	}
+	require.NoError(t, f.BuildWeekly(context.Background(), 1, 100))
+	require.True(t, called)
+}
+
 func TestAssemblerFunc_AdaptsFunc(t *testing.T) {
 	called := false
 	var f AssemblerFunc = func(_ context.Context, _ AssembleReq) error {
