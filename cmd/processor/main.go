@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/virsi/mute-bot/internal/alerts"
 	"github.com/virsi/mute-bot/internal/bot"
 	"github.com/virsi/mute-bot/internal/classify"
 	"github.com/virsi/mute-bot/internal/config"
@@ -115,6 +116,7 @@ func run() error {
 	embeddingsRepo := postgres.NewEmbeddingsRepo(pool)
 	deliveriesRepo := postgres.NewDeliveriesRepo(pool)
 	settingsRepo := postgres.NewSettingsRepo(pool)
+	usersRepo := postgres.NewUsersRepo(pool)
 
 	// LLM client + budget guard. One BudgetGuard is shared between the
 	// embedder and the classifier so the monthly cap covers the whole
@@ -261,10 +263,28 @@ func run() error {
 		}()
 	}
 
+	// Alerts worker: second durable on cluster.scored alongside rank. The
+	// JetStream consumer name ("alerts") is what isolates the two subscriptions
+	// so each gets its own copy of every cluster.scored message; one stream,
+	// two independent flow-control + ack pipelines.
+	//
+	// The Topics matcher is a pass-through stub until M4's internal/topics
+	// service lands. When M4 wires its real matcher, this single line
+	// changes — the worker contract does not.
+	alertThrottle := rdb.NewAlertThrottle(rclient)
+	alertWorker := alerts.NewWorker(alerts.Deps{
+		Users:    alertsUsersAdapter{repo: usersRepo},
+		Clusters: alertsClustersAdapter{repo: clustersRepo},
+		Topics:   alerts.PassThroughTopics{},
+		Throttle: alertThrottle,
+		Sender:   sender,
+	})
+
 	consume(queue.StreamIngest, queue.SubjectRaw, "normalizer", normalizeWorker.Handle)
 	consume(queue.StreamIngest, queue.SubjectNormalized, "dedup", dedupWorker.Handle)
 	consume(queue.StreamClusters, queue.SubjectClusterUpdate, "classify", classifyWorker.Handle)
 	consume(queue.StreamClusters, queue.SubjectClusterScored, "rank", rankWorker.Handle)
+	consume(queue.StreamClusters, queue.SubjectClusterScored, "alerts", alertWorker.Handle)
 	consume(queue.StreamDelivery, queue.SubjectDeliverySched, "delivery", deliveryWorker.Handle)
 
 	slog.Info("processor: pipeline running")
@@ -292,4 +312,46 @@ func (a rankerClustersAdapter) Snapshot(ctx context.Context, clusterID int64) (r
 
 func (a rankerClustersAdapter) SetScore(ctx context.Context, clusterID int64, score float32) error {
 	return a.repo.SetScore(ctx, clusterID, score)
+}
+
+// alertsUsersAdapter bridges *postgres.UsersRepo to alerts.UsersForAlert.
+// The adapter exists so the alerts package can keep its own EligibleUser
+// type free of the postgres struct, preserving the package boundary.
+type alertsUsersAdapter struct{ repo *postgres.UsersRepo }
+
+func (a alertsUsersAdapter) ListEligible(ctx context.Context) ([]alerts.EligibleUser, error) {
+	in, err := a.repo.ListAlertEligible(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]alerts.EligibleUser, 0, len(in))
+	for _, e := range in {
+		out = append(out, alerts.EligibleUser{
+			UserID:         e.UserID,
+			TGUserID:       e.TGUserID,
+			AlertThreshold: e.Threshold,
+			ThrottleMin:    e.ThrottleMin,
+		})
+	}
+	return out, nil
+}
+
+// alertsClustersAdapter bridges *postgres.ClustersRepo to
+// alerts.ClusterReader. The alerts worker only needs five fields
+// (headline, summary, topics, coverage, score) so we project the
+// postgres row onto the smaller alerts type.
+type alertsClustersAdapter struct{ repo *postgres.ClustersRepo }
+
+func (a alertsClustersAdapter) Get(ctx context.Context, id int64) (alerts.Cluster, error) {
+	c, err := a.repo.Get(ctx, id)
+	if err != nil {
+		return alerts.Cluster{}, err
+	}
+	return alerts.Cluster{
+		Headline: c.Headline,
+		Summary:  c.Summary,
+		Topics:   c.Topics,
+		Coverage: c.Coverage,
+		Score:    c.Score,
+	}, nil
 }
