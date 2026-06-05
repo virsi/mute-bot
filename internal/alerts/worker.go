@@ -39,9 +39,13 @@ type UsersForAlert interface {
 
 // Throttler decides whether a per-(user, topic) push is allowed right now.
 // Returns true when the slot was acquired (push allowed), false when a
-// previous alert in the same window is still holding it.
+// previous alert in the same window is still holding it. Release lets the
+// worker undo a freshly-acquired slot when the subsequent send fails so
+// the user is not locked out for the whole TTL despite never receiving
+// the alert.
 type Throttler interface {
 	Allow(ctx context.Context, userID int64, topic string, ttl time.Duration) (bool, error)
+	Release(ctx context.Context, userID int64, topic string) error
 }
 
 // Cluster is the read model the worker needs from the clusters store. The
@@ -171,8 +175,15 @@ func (w *Worker) Handle(ctx context.Context, payload []byte) error {
 			continue
 		}
 
+		// Guard against malformed settings that would push the throttle
+		// TTL negative (Redis SETEX rejects non-positive seconds). Falls
+		// back to the same 30-minute default as the migration.
+		throttleMin := u.ThrottleMin
+		if throttleMin <= 0 {
+			throttleMin = 30
+		}
 		ok, err := w.d.Throttle.Allow(ctx, u.UserID, topicKey,
-			time.Duration(u.ThrottleMin)*time.Minute)
+			time.Duration(throttleMin)*time.Minute)
 		if err != nil {
 			w.d.Logger.WarnContext(ctx, "alerts: throttle",
 				slog.Int64("user", u.UserID), slog.Any("err", err))
@@ -186,6 +197,13 @@ func (w *Worker) Handle(ctx context.Context, payload []byte) error {
 		if err := w.d.Sender.SendDigest(ctx, u.TGUserID, text); err != nil {
 			w.d.Logger.WarnContext(ctx, "alerts: send",
 				slog.Int64("user", u.UserID), slog.Any("err", err))
+			// Send failed: free the throttle slot so the next delivery
+			// attempt can try again. Without this the user is locked
+			// out for the entire TTL despite never receiving the alert.
+			if rErr := w.d.Throttle.Release(ctx, u.UserID, topicKey); rErr != nil {
+				w.d.Logger.WarnContext(ctx, "alerts: throttle release",
+					slog.Int64("user", u.UserID), slog.Any("err", rErr))
+			}
 		}
 	}
 	return nil
