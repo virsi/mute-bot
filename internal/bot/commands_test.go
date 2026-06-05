@@ -409,6 +409,165 @@ func TestHandleBuy_InvoiceError_PropagatesAndNoButtonSent(t *testing.T) {
 	require.Equal(t, 0, btn.calls)
 }
 
+// fakeAlertSettings is a SettingsRepo stub that flips its `get` value to
+// `stored` after Upsert so HandleAlerts's post-write re-read returns the
+// just-written row (the production repo's COALESCE defaults are applied
+// in SQL — the stub mimics that by promoting the SettingsUpdate verbatim,
+// with a fixed default for AlertThreshold and AlertThrottleMin when the
+// caller leaves them zero, matching migration 0001 + 0005 defaults).
+type fakeAlertSettings struct {
+	stored postgres.SettingsUpdate
+	get    postgres.Settings
+}
+
+func (f *fakeAlertSettings) Upsert(_ context.Context, _ int64, in postgres.SettingsUpdate) error {
+	f.stored = in
+	// Promote to Get so the post-write read returns the updated row.
+	if in.AlertThreshold == 0 {
+		in.AlertThreshold = f.get.AlertThreshold
+		if in.AlertThreshold == 0 {
+			in.AlertThreshold = 85
+		}
+	}
+	if in.AlertThrottleMin == 0 {
+		in.AlertThrottleMin = f.get.AlertThrottleMin
+		if in.AlertThrottleMin == 0 {
+			in.AlertThrottleMin = 30
+		}
+	}
+	f.get = postgres.Settings{
+		Topics:           in.Topics,
+		Threshold:        in.Threshold,
+		ScheduleJSON:     in.ScheduleJSON,
+		AlertsEnabled:    in.AlertsEnabled,
+		AlertThreshold:   in.AlertThreshold,
+		AlertThrottleMin: in.AlertThrottleMin,
+		WeeklyEnabled:    in.WeeklyEnabled,
+	}
+	return nil
+}
+
+func (f *fakeAlertSettings) Get(_ context.Context, _ int64) (postgres.Settings, error) {
+	return f.get, nil
+}
+
+func TestAlerts_NoArgs_ShowsStatus(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: true, AlertThreshold: 80, AlertThrottleMin: 15,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", nil))
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "включены")
+	require.Contains(t, send.msgs[0], "80/100")
+	require.Contains(t, send.msgs[0], "15")
+}
+
+func TestAlerts_On(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: false, AlertThreshold: 85, AlertThrottleMin: 30,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", []string{"on"}))
+	require.True(t, st.stored.AlertsEnabled)
+	require.Equal(t, 85, st.stored.AlertThreshold)
+	require.Equal(t, 30, st.stored.AlertThrottleMin)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "включены")
+}
+
+func TestAlerts_Off(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: true, AlertThreshold: 85, AlertThrottleMin: 30,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", []string{"off"}))
+	require.False(t, st.stored.AlertsEnabled)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "выключены")
+}
+
+func TestAlerts_Threshold(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: true, AlertThreshold: 85, AlertThrottleMin: 30,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", []string{"threshold", "70"}))
+	require.Equal(t, 70, st.stored.AlertThreshold)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "70/100")
+}
+
+func TestAlerts_ThresholdOutOfRange(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: true, AlertThreshold: 85, AlertThrottleMin: 30,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", []string{"threshold", "150"}))
+	// stored stays at zero-value because Upsert must not have been called.
+	require.Equal(t, 0, st.stored.AlertThreshold)
+	require.Len(t, send.msgs, 1)
+}
+
+func TestAlerts_ThresholdMissingArg(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: true, AlertThreshold: 85, AlertThrottleMin: 30,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", []string{"threshold"}))
+	require.Equal(t, 0, st.stored.AlertThreshold)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "Использование")
+}
+
+func TestAlerts_Throttle(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: true, AlertThreshold: 85, AlertThrottleMin: 30,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", []string{"throttle", "10"}))
+	require.Equal(t, 10, st.stored.AlertThrottleMin)
+	require.Len(t, send.msgs, 1)
+	require.Contains(t, send.msgs[0], "10 мин")
+}
+
+func TestAlerts_ThrottleZeroRejected(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: true, AlertThreshold: 85, AlertThrottleMin: 30,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", []string{"throttle", "0"}))
+	require.Equal(t, 0, st.stored.AlertThrottleMin, "zero throttle must not be persisted")
+}
+
+func TestAlerts_UnknownSubcommand(t *testing.T) {
+	send := &capturedSender{}
+	st := &fakeAlertSettings{get: postgres.Settings{
+		AlertsEnabled: true, AlertThreshold: 85, AlertThrottleMin: 30,
+	}}
+	h := NewHandlers(HandlersDeps{Users: &fakeUsers{}, Settings: st, API: send})
+
+	require.NoError(t, h.HandleAlerts(context.Background(), 555, "alice", []string{"foo"}))
+	require.Equal(t, postgres.SettingsUpdate{}, st.stored, "unknown subcommand must not write")
+	require.Len(t, send.msgs, 1)
+}
+
 func TestAssemblerFunc_AdaptsFunc(t *testing.T) {
 	called := false
 	var f AssemblerFunc = func(_ context.Context, _ AssembleReq) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -359,5 +360,94 @@ func (h *Handlers) HandleBuy(ctx context.Context, tgUserID int64, username strin
 			"Нажмите кнопку ниже, чтобы оплатить.",
 		"Купить за 99 ⭐ / мес",
 		url,
+	)
+}
+
+// HandleAlerts implements /alerts. The command is Pro-gated by the
+// wiring layer (see RequirePro in middleware.go), so this body assumes
+// the caller is already entitled. Subcommands:
+//
+//	/alerts             → show current state
+//	/alerts on|off      → toggle delivery
+//	/alerts threshold N → set the cluster-score gate (0..100)
+//	/alerts throttle N  → set the per-topic cool-down (minutes, ≥1)
+//
+// Every write reads the existing settings first and copies through every
+// field the user did not touch, so toggling alerts_enabled cannot wipe
+// the digest schedule or the topic preset.
+func (h *Handlers) HandleAlerts(ctx context.Context, tgUserID int64, username string, args []string) error {
+	u, _, err := h.d.Users.GetOrCreate(ctx, tgUserID, username)
+	if err != nil {
+		return fmt.Errorf("get_or_create user: %w", err)
+	}
+	s, err := h.d.Settings.Get(ctx, u.ID)
+	if err != nil {
+		return fmt.Errorf("get settings: %w", err)
+	}
+	if len(args) == 0 {
+		return h.d.API.Send(ctx, tgUserID, renderAlertsStatus(s))
+	}
+
+	upd := postgres.SettingsUpdate{
+		Topics:           s.Topics,
+		Threshold:        s.Threshold,
+		ScheduleJSON:     s.ScheduleJSON,
+		AlertsEnabled:    s.AlertsEnabled,
+		AlertThreshold:   s.AlertThreshold,
+		AlertThrottleMin: s.AlertThrottleMin,
+		WeeklyEnabled:    s.WeeklyEnabled,
+	}
+
+	switch strings.ToLower(args[0]) {
+	case "on":
+		upd.AlertsEnabled = true
+	case "off":
+		upd.AlertsEnabled = false
+	case "threshold":
+		if len(args) < 2 {
+			return h.d.API.Send(ctx, tgUserID, "Использование: /alerts threshold N (0..100)")
+		}
+		n, err := strconv.Atoi(args[1])
+		if err != nil || n < 0 || n > 100 {
+			return h.d.API.Send(ctx, tgUserID, "Порог alert'а должен быть от 0 до 100.")
+		}
+		upd.AlertThreshold = n
+	case "throttle":
+		if len(args) < 2 {
+			return h.d.API.Send(ctx, tgUserID, "Использование: /alerts throttle N (минут)")
+		}
+		n, err := strconv.Atoi(args[1])
+		if err != nil || n < 1 {
+			return h.d.API.Send(ctx, tgUserID, "Throttle должен быть ≥ 1 минута.")
+		}
+		upd.AlertThrottleMin = n
+	default:
+		return h.d.API.Send(ctx, tgUserID,
+			"Доступно: /alerts | /alerts on|off | /alerts threshold N | /alerts throttle N")
+	}
+
+	if err := h.d.Settings.Upsert(ctx, u.ID, upd); err != nil {
+		return fmt.Errorf("upsert settings: %w", err)
+	}
+	// Re-read so the confirmation reflects the COALESCE defaults the repo
+	// applies when N=0 — the user sees the same number the worker will use.
+	after, err := h.d.Settings.Get(ctx, u.ID)
+	if err != nil {
+		return fmt.Errorf("get settings after upsert: %w", err)
+	}
+	return h.d.API.Send(ctx, tgUserID, renderAlertsStatus(after))
+}
+
+// renderAlertsStatus renders the human-readable summary of the alerts
+// configuration. Kept as a package helper so HandleAlerts emits the same
+// shape for the show-only path and the post-write confirmation.
+func renderAlertsStatus(s postgres.Settings) string {
+	state := "выключены"
+	if s.AlertsEnabled {
+		state = "включены"
+	}
+	return fmt.Sprintf(
+		"Alerts: %s\nПорог: %d/100\nThrottle: %d мин",
+		state, s.AlertThreshold, s.AlertThrottleMin,
 	)
 }
