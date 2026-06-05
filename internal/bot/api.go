@@ -60,6 +60,29 @@ func (s *SendOnly) SendURLButton(ctx context.Context, chatID int64, text, button
 	return nil
 }
 
+// SendTwoURLButtons pushes one HTML-parsed message with two inline-keyboard
+// URL buttons stacked vertically. Used by /buy to offer the user a choice
+// between Telegram Stars and YooKassa payment channels.
+func (s *SendOnly) SendTwoURLButtons(ctx context.Context, chatID int64, text,
+	label1, url1, label2, url2 string,
+) error {
+	_, err := s.b.SendMessage(ctx, &tgbot.SendMessageParams{
+		ChatID:    chatID,
+		Text:      text,
+		ParseMode: models.ParseModeHTML,
+		ReplyMarkup: &models.InlineKeyboardMarkup{
+			InlineKeyboard: [][]models.InlineKeyboardButton{
+				{{Text: label1, URL: url1}},
+				{{Text: label2, URL: url2}},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("send two-url-button message: %w", err)
+	}
+	return nil
+}
+
 // Client is the full Bot API used by cmd/bot-api for long-polling, command
 // handlers, sendInvoice, and pre-checkout webhooks. Embeds SendOnly so it
 // satisfies the API interface used by Sender.

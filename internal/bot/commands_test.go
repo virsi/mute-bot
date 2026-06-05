@@ -336,7 +336,7 @@ func TestHandleBuy_NoInvoicerFallsBackToStub(t *testing.T) {
 
 	require.NoError(t, h.HandleBuy(context.Background(), 555, "alice"))
 	require.Len(t, send.msgs, 1)
-	require.Contains(t, send.msgs[0], "Stars")
+	require.Contains(t, send.msgs[0], "Оплата подписки")
 }
 
 // fakeInvoicer stubs the billing.Service surface used by /buy.
@@ -378,7 +378,11 @@ func (f *fakeButtonAPI) SendURLButton(_ context.Context, chatID int64, text, btn
 
 func TestHandleBuy_WithInvoicer_SendsURLButton(t *testing.T) {
 	send := &capturedSender{}
-	inv := &fakeInvoicer{url: "https://t.me/$abcdef"}
+	// TwoButton not wired and YooKassa unknown → legacy single-button flow.
+	inv := &fakeMultiInvoicer{
+		urls: map[string]string{"tg_stars": "https://t.me/$abcdef"},
+		errs: map[string]error{"yookassa": errors.New("billing: unknown provider")},
+	}
 	btn := &fakeButtonAPI{}
 	reg := &fakeRegistrarRecorder{}
 	h := NewHandlers(HandlersDeps{
@@ -388,9 +392,6 @@ func TestHandleBuy_WithInvoicer_SendsURLButton(t *testing.T) {
 
 	require.NoError(t, h.HandleBuy(context.Background(), 555, "alice"))
 	require.True(t, reg.called, "user must be registered before paying")
-	require.Equal(t, 1, inv.calls)
-	require.Equal(t, int64(555), inv.lastUser)
-	require.Equal(t, "pro_30d", inv.lastPlan)
 	require.Equal(t, 1, btn.calls)
 	require.Equal(t, int64(555), btn.lastChatID)
 	require.Equal(t, "https://t.me/$abcdef", btn.lastURL)
@@ -410,6 +411,92 @@ func TestHandleBuy_InvoiceError_PropagatesAndNoButtonSent(t *testing.T) {
 	err := h.HandleBuy(context.Background(), 555, "alice")
 	require.Error(t, err)
 	require.Equal(t, 0, btn.calls)
+}
+
+// fakeMultiInvoicer returns provider-keyed URLs and errors so /buy tests
+// can exercise the Stars + YooKassa multi-provider dispatch.
+type fakeMultiInvoicer struct {
+	urls  map[string]string
+	errs  map[string]error
+	calls int
+}
+
+func (f *fakeMultiInvoicer) CreateInvoice(_ context.Context, provider string, _ int64, _ string) (string, error) {
+	f.calls++
+	if f.errs != nil {
+		if err, ok := f.errs[provider]; ok {
+			return "", err
+		}
+	}
+	return f.urls[provider], nil
+}
+
+// fakeTwoButton captures SendTwoURLButtons invocations.
+type fakeTwoButton struct {
+	called bool
+	args   []string // [text, label1, url1, label2, url2]
+}
+
+func (f *fakeTwoButton) SendTwoURLButtons(_ context.Context, _ int64, text,
+	l1, u1, l2, u2 string,
+) error {
+	f.called = true
+	f.args = []string{text, l1, u1, l2, u2}
+	return nil
+}
+
+func TestHandleBuy_BothProviders_TwoButtons(t *testing.T) {
+	users := &fakeUsers{}
+	api := &capturedSender{}
+	tb := &fakeTwoButton{}
+	inv := &fakeMultiInvoicer{urls: map[string]string{
+		"tg_stars": "stars://abc",
+		"yookassa": "https://yk/x",
+	}}
+	h := NewHandlers(HandlersDeps{
+		Users: users, Settings: &fakeSettings{}, API: api,
+		Invoicer: inv, TwoButton: tb, Registrar: &fakeRegistrarRecorder{},
+	})
+	require.NoError(t, h.HandleBuy(context.Background(), 100, "alice"))
+	require.True(t, tb.called)
+	require.Equal(t, "stars://abc", tb.args[2])
+	require.Equal(t, "https://yk/x", tb.args[4])
+	require.Contains(t, tb.args[1], "Stars")
+	require.Contains(t, tb.args[3], "YooKassa")
+}
+
+func TestHandleBuy_YooKassaUnknown_FallsBackToSingleStarsButton(t *testing.T) {
+	send := &capturedSender{}
+	ba := &fakeButtonAPI{}
+	inv := &fakeMultiInvoicer{
+		urls: map[string]string{"tg_stars": "stars://abc"},
+		errs: map[string]error{"yookassa": errors.New("billing: unknown provider")},
+	}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{},
+		API: send, Invoicer: inv, ButtonAPI: ba, TwoButton: nil,
+		Registrar: &fakeRegistrarRecorder{},
+	})
+	require.NoError(t, h.HandleBuy(context.Background(), 100, "alice"))
+	require.Equal(t, 1, ba.calls)
+	require.Equal(t, "stars://abc", ba.lastURL)
+}
+
+func TestHandleBuy_TwoButtonNil_FallsBackToSingleStarsButton(t *testing.T) {
+	send := &capturedSender{}
+	ba := &fakeButtonAPI{}
+	inv := &fakeMultiInvoicer{urls: map[string]string{
+		"tg_stars": "stars://abc",
+		"yookassa": "https://yk/x",
+	}}
+	h := NewHandlers(HandlersDeps{
+		Users: &fakeUsers{}, Settings: &fakeSettings{},
+		API: send, Invoicer: inv, ButtonAPI: ba, TwoButton: nil,
+		Registrar: &fakeRegistrarRecorder{},
+	})
+	require.NoError(t, h.HandleBuy(context.Background(), 100, "alice"))
+	require.Equal(t, 1, ba.calls, "must use single-button when TwoButton is nil")
+	require.Equal(t, "stars://abc", ba.lastURL)
 }
 
 // fakeAlertSettings is a SettingsRepo stub that flips its `get` value to

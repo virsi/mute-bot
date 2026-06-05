@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -19,6 +20,7 @@ import (
 
 	tgbot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/virsi/mute-bot/internal/billing"
 	"github.com/virsi/mute-bot/internal/bot"
@@ -49,10 +51,22 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Metrics endpoint on the bot-api slot. Exposes long-poll loop health
-	// and Bot API send counters scraped by Prometheus.
-	metricsSrv := obs.ServeMetrics(":9103")
-	defer func() { _ = metricsSrv.Close() }()
+	// HTTP slot on :9103. Hosts /metrics + /healthz; the YooKassa webhook
+	// /yookassa/webhook is mounted later once the billing.Service is
+	// built. Building http.Server here lets the same listener serve all
+	// three paths so deployments do not need extra ports for billing.
+	httpMux := http.NewServeMux()
+	httpMux.Handle("/metrics", promhttp.Handler())
+	httpMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	httpSrv := &http.Server{
+		Addr:              ":9103",
+		Handler:           httpMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	// Start the listener after we have wired the YooKassa webhook below.
+	defer func() { _ = httpSrv.Close() }()
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -122,20 +136,48 @@ func run() error {
 		Model:    cfg.LLM.EmbeddingModel,
 	})
 
-	// Billing wiring: StarsProvider over the live Bot API + Service over
-	// (provider, subsRepo, usersSvc). Service.Settle is the idempotent
-	// activation entry point invoked by the payment_handlers below.
+	// Billing wiring: StarsProvider over the live Bot API. YooKassa is
+	// optional — only enabled when shop_id + secret_key + base_external_url
+	// are all set so the bot keeps booting on Stars-only deployments.
+	// Service.Settle is the idempotent activation entry point invoked by
+	// the payment_handlers (Stars) and yookassa_webhook (YooKassa).
 	starsProvider := billing.NewStarsProvider(client.Bot())
+	providers := map[string]billing.Provider{"tg_stars": starsProvider}
+	var ykProvider *billing.YooKassaProvider
+	if cfg.YooKassa.ShopID != "" && cfg.YooKassa.SecretKey != "" && cfg.BaseExternalURL != "" {
+		ykProvider = billing.NewYooKassaProvider(billing.YooKassaDeps{
+			ShopID:     cfg.YooKassa.ShopID,
+			SecretKey:  cfg.YooKassa.SecretKey,
+			WebhookURL: cfg.BaseExternalURL + "/yookassa/webhook",
+			ReturnURL:  cfg.YooKassa.ReturnURL,
+		})
+		providers["yookassa"] = ykProvider
+		slog.Info("bot-api: yookassa provider enabled",
+			slog.String("webhook_url", cfg.BaseExternalURL+"/yookassa/webhook"))
+	}
 	billingSvc := billing.NewService(billing.Deps{
-		Provider: starsProvider,
-		Subs:     subsRepo,
-		Users:    usersSvc,
+		Providers: providers,
+		Subs:      subsRepo,
+		Users:     usersSvc,
 	})
 	paymentHandlers := bot.NewPaymentHandlers(bot.PaymentHandlersDeps{
 		Acker:   client.Bot(),
 		Settler: billingSvc,
 		API:     &client.SendOnly,
 	})
+	// Attach the YooKassa webhook to the shared HTTP mux when configured.
+	if ykProvider != nil && cfg.YooKassa.WebhookSecret != "" {
+		httpMux.Handle("/yookassa/webhook", billing.NewYooKassaWebhook(billing.YooKassaWebhookDeps{
+			Settler: billingSvc,
+			Secret:  cfg.YooKassa.WebhookSecret,
+		}))
+	}
+	// Start the HTTP listener now that all routes are mounted.
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("bot-api: http server error", slog.Any("err", err))
+		}
+	}()
 
 	assembler := digest.NewAssembler(digest.AssemblerDeps{
 		Settings:   settings,
@@ -187,6 +229,7 @@ func run() error {
 		Tier:      usersSvc,
 		Invoicer:  billingSvc,
 		ButtonAPI: &client.SendOnly,
+		TwoButton: &client.SendOnly,
 		Topics:    topicsSvc,
 		Weekly:    weeklyAdapter,
 	})

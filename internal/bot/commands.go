@@ -93,6 +93,13 @@ type URLButtonSender interface {
 	SendURLButton(ctx context.Context, chatID int64, text, buttonText, url string) error
 }
 
+// TwoURLButtonSender pushes a message with two inline URL buttons used by
+// /buy to render the Stars + YooKassa choice. Satisfied by *SendOnly.
+type TwoURLButtonSender interface {
+	SendTwoURLButtons(ctx context.Context, chatID int64, text,
+		label1, url1, label2, url2 string) error
+}
+
 // Invoicer is the surface HandleBuy calls into. Satisfied by
 // *billing.Service in production. provider keys the dispatch back to
 // the right Provider instance — "tg_stars" or "yookassa".
@@ -143,6 +150,10 @@ type HandlersDeps struct {
 	Tier      TierChecker
 	Invoicer  Invoicer
 	ButtonAPI URLButtonSender
+	// TwoButton enables the M2 two-button /buy UI (Stars + YooKassa).
+	// When nil, /buy falls back to the legacy single-button Stars-only
+	// path so deployments without YooKassa keep working.
+	TwoButton TwoURLButtonSender
 	Topics    TopicsService
 	// Weekly is the on-demand weekly digest assembler used by /weekly.
 	// Nil-safe — when unwired the handler falls back to a friendly stub
@@ -448,36 +459,54 @@ func (h *Handlers) HandleWeeklySettings(ctx context.Context, tgUserID int64, use
 		fmt.Sprintf("Еженедельный дайджест %s.", state))
 }
 
-// HandleBuy implements /buy. When the Invoicer and ButtonAPI collaborators
-// are wired (production), it asks billing for a Stars invoice URL and
-// pushes a message with a single inline-keyboard button labelled
-// "Купить за 99 ⭐ / мес" that opens the link. When either is nil
-// (unit tests or partial wiring) it falls back to the M2 stub reply so
-// the command stays well-defined.
+// HandleBuy implements /buy. The handler picks one of three paths:
+//
+//   - When TwoButton + Invoicer are wired AND YooKassa is a registered
+//     provider, the user gets two buttons (99 ⭐ Stars and 150 ₽ YooKassa).
+//   - When only Stars is available (YooKassa returns ErrProviderUnknown
+//     or TwoButton is nil), the legacy single-button Stars-only flow runs.
+//   - When neither Invoicer nor ButtonAPI is wired (unit tests / partial
+//     deployments) the handler replies with a stub message.
 //
 // The Registrar (a users.Service) is consulted first so that paying users
-// have a row before the Stars callback ever fires.
+// have a row before any payment callback fires.
 func (h *Handlers) HandleBuy(ctx context.Context, tgUserID int64, username string) error {
-	if h.d.Invoicer == nil || h.d.ButtonAPI == nil {
+	if h.d.Invoicer == nil {
 		return h.d.API.Send(ctx, tgUserID,
-			"Оплата подписки скоро будет доступна через Telegram Stars (99 XTR/мес). "+
-				"Сейчас функция в разработке.")
+			"Оплата подписки скоро будет доступна. Сейчас функция в разработке.")
 	}
 	if h.d.Registrar != nil {
 		if _, _, err := h.d.Registrar.RegisterOnStart(ctx, tgUserID, username); err != nil {
 			return fmt.Errorf("register user: %w", err)
 		}
 	}
-	url, err := h.d.Invoicer.CreateInvoice(ctx, "tg_stars", tgUserID, "pro_30d")
-	if err != nil {
-		return fmt.Errorf("create invoice: %w", err)
+	starsURL, errStars := h.d.Invoicer.CreateInvoice(ctx, "tg_stars", tgUserID, "pro_30d")
+	if errStars != nil {
+		return fmt.Errorf("create stars invoice: %w", errStars)
 	}
-	return h.d.ButtonAPI.SendURLButton(ctx, tgUserID,
-		"Pro подписка — 99 ⭐ в месяц.\n\n"+
-			"Включает кастомные темы, real-time alerts и безлимит /digest. "+
-			"Нажмите кнопку ниже, чтобы оплатить.",
-		"Купить за 99 ⭐ / мес",
-		url,
+	// Try YooKassa. ErrProviderUnknown means it is not configured for
+	// this deployment — fall back to the Stars-only button.
+	ykURL, errYK := h.d.Invoicer.CreateInvoice(ctx, "yookassa", tgUserID, "pro_30d_rub")
+	twoButtons := h.d.TwoButton != nil && errYK == nil
+	if !twoButtons {
+		if h.d.ButtonAPI == nil {
+			return h.d.API.Send(ctx, tgUserID,
+				"Оплата подписки скоро будет доступна через Telegram Stars (99 XTR/мес).")
+		}
+		return h.d.ButtonAPI.SendURLButton(ctx, tgUserID,
+			"Pro подписка — 99 ⭐ в месяц.\n\n"+
+				"Включает кастомные темы, real-time alerts, weekly digest и безлимит /digest. "+
+				"Нажмите кнопку ниже, чтобы оплатить.",
+			"Купить за 99 ⭐ / мес",
+			starsURL,
+		)
+	}
+	return h.d.TwoButton.SendTwoURLButtons(ctx, tgUserID,
+		"Pro подписка — 30 дней.\n\n"+
+			"Включает кастомные темы, real-time alerts, weekly digest и безлимит /digest. "+
+			"Выберите способ оплаты:",
+		"99 ⭐ Telegram Stars / мес", starsURL,
+		"150 ₽ картой (YooKassa) / мес", ykURL,
 	)
 }
 
