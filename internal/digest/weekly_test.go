@@ -149,25 +149,30 @@ func TestWeeklyAssembler_AntiRepeat_PreviousWeekExcluded(t *testing.T) {
 	require.Len(t, sender.messages, 1)
 }
 
-func TestWeeklyAssembler_SkipAntiRepeat_OnDemandReSend(t *testing.T) {
+// TestWeeklyAssembler_OnDemand_AlreadyDelivered pins the post-review
+// contract: when /weekly is invoked on-demand and the user has already
+// received this ISO week's digest, BuildWeekly is a no-op (no second
+// send). The HasWeekRow check is unconditional; on-demand no longer
+// bypasses it because cron + /weekly otherwise produced two messages
+// for the same week.
+func TestWeeklyAssembler_OnDemand_AlreadyDelivered(t *testing.T) {
 	now := time.Date(2026, 6, 7, 18, 0, 0, 0, time.UTC)
 	sender := &stubSender{}
-	weekly := &stubWeeklyRepo{has: true} // already sent
+	weekly := &stubWeeklyRepo{has: true}
 	clusters := &stubTopReader{list: []postgres.Cluster{
 		{ID: 11, Headline: "h1", Topics: []string{"politics"}, Score: 0.9},
 	}}
 	asm := NewWeeklyAssembler(WeeklyAssemblerDeps{
-		Settings:       &stubSettings{s: postgres.Settings{Topics: []string{"politics"}}},
-		Clusters:       clusters,
-		Weekly:         weekly,
-		Sources:        &stubSources{},
-		Sender:         sender,
-		SkipAntiRepeat: true,
-		Now:            func() time.Time { return now },
+		Settings: &stubSettings{s: postgres.Settings{Topics: []string{"politics"}}},
+		Clusters: clusters,
+		Weekly:   weekly,
+		Sources:  &stubSources{},
+		Sender:   sender,
+		Now:      func() time.Time { return now },
 	})
 	require.NoError(t, asm.BuildWeekly(context.Background(), WeeklyRequest{UserID: 1, TGUserID: 100}))
-	require.Len(t, sender.messages, 1, "on-demand must re-send even when HasWeekRow=true")
-	require.Empty(t, weekly.inserted, "on-demand must NOT record into weekly_deliveries")
+	require.Empty(t, sender.messages, "no second send when HasWeekRow=true")
+	require.Empty(t, weekly.inserted, "no extra row recorded")
 }
 
 func TestWeeklyAssembler_TitleContainsDateRange(t *testing.T) {

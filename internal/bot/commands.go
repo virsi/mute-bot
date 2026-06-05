@@ -376,11 +376,11 @@ func (h *Handlers) HandleSettings(ctx context.Context, tgUserID int64, username 
 }
 
 // HandleWeekly implements the on-demand /weekly command. Pro-only — the
-// gate is applied by the wiring layer (RequirePro middleware). On-demand
-// /weekly intentionally bypasses the once-per-ISO-week anti-repeat so a
-// Pro user can re-pull the digest on demand; the assembler is configured
-// with SkipAntiRepeat=true in cmd/bot-api so this handler does not need
-// any special-casing.
+// gate is applied by the wiring layer (RequirePro middleware). The
+// once-per-ISO-week anti-repeat is shared with the Sunday cron path:
+// if the user has already received the weekly digest in the current ISO
+// week, BuildWeekly is a no-op. The handler then sends a short notice
+// so the user understands why no digest arrived.
 func (h *Handlers) HandleWeekly(ctx context.Context, tgUserID int64, username string) error {
 	if h.d.Weekly == nil {
 		return h.d.API.Send(ctx, tgUserID, "Недельная сводка скоро будет доступна.")

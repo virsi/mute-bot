@@ -174,6 +174,11 @@ func (r *ClustersRepo) TopByScoreSince(
 	if limit <= 0 {
 		limit = 10
 	}
+	// Cap at 100 so a bad caller (or future endpoint that exposes limit to
+	// user input) can't ask for a million rows and stall the DB.
+	if limit > 100 {
+		limit = 100
+	}
 	if excludeIDs == nil {
 		excludeIDs = []int64{}
 	}

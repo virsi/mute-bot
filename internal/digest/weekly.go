@@ -49,12 +49,6 @@ type WeeklyAssemblerDeps struct {
 	// Title overrides the default ru-RU header (the date range is appended
 	// in parentheses).
 	Title string
-	// SkipAntiRepeat — when true, the assembler ignores HasWeekRow and does
-	// NOT record InsertIfAbsent. Used by the on-demand /weekly command so a
-	// Pro user can re-pull the digest as many times as they want without
-	// burning the cron's once-per-week anti-repeat. The cron path keeps
-	// this false so Sunday-18:00 fan-out stays idempotent.
-	SkipAntiRepeat bool
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -92,23 +86,24 @@ type WeeklyRequest struct {
 }
 
 // BuildWeekly assembles, sends, and records the weekly digest for the
-// requested user. Returns nil when there is nothing to send (no clusters
-// or the user has already received this week's digest via the cron path
-// — on-demand /weekly bypasses HasWeekRow via SkipAntiRepeat).
+// requested user. The HasWeekRow check is unconditional: cron and the
+// on-demand /weekly command both consult the same anti-repeat marker so
+// the user cannot end up with two copies (cron fires Sunday-18:00, then
+// the user taps /weekly an hour later, or vice versa). Returns nil when
+// nothing is to be sent (already delivered this ISO week, or no clusters
+// passed the topic / custom-topic filters).
 func (a *WeeklyAssembler) BuildWeekly(ctx context.Context, req WeeklyRequest) error {
 	now := a.d.Now()
 	isoWeek := ISOWeekKey(now)
 
-	if !a.d.SkipAntiRepeat {
-		has, err := a.d.Weekly.HasWeekRow(ctx, req.UserID, isoWeek)
-		if err != nil {
-			return fmt.Errorf("has weekly row: %w", err)
-		}
-		if has {
-			a.d.Logger.InfoContext(ctx, "weekly: already sent this iso week",
-				slog.Int64("user_id", req.UserID), slog.String("iso_week", isoWeek))
-			return nil
-		}
+	has, err := a.d.Weekly.HasWeekRow(ctx, req.UserID, isoWeek)
+	if err != nil {
+		return fmt.Errorf("has weekly row: %w", err)
+	}
+	if has {
+		a.d.Logger.InfoContext(ctx, "weekly: already sent this iso week",
+			slog.Int64("user_id", req.UserID), slog.String("iso_week", isoWeek))
+		return nil
 	}
 
 	s, err := a.d.Settings.Get(ctx, req.UserID)
@@ -161,9 +156,6 @@ func (a *WeeklyAssembler) BuildWeekly(ctx context.Context, req WeeklyRequest) er
 	}
 	if err := a.d.Sender.SendDigest(ctx, req.TGUserID, text); err != nil {
 		return fmt.Errorf("send: %w", err)
-	}
-	if a.d.SkipAntiRepeat {
-		return nil
 	}
 	for _, it := range items {
 		if _, err := a.d.Weekly.InsertIfAbsent(ctx, req.UserID, it.ClusterID, isoWeek); err != nil {

@@ -157,22 +157,22 @@ func run() error {
 	})
 
 	// Weekly digest wiring: shares the daily collaborators but uses its
-	// own TopByScoreSince + anti-repeat repo. On-demand /weekly bypasses
-	// the once-per-week guard (SkipAntiRepeat=true) so a Pro user can
-	// re-pull the digest as many times as they want without colliding
-	// with the Sunday cron path.
-	weeklyRepoBA := postgres.NewWeeklyDeliveriesRepo(pool)
+	// own TopByScoreSince + anti-repeat repo. Anti-repeat is now a hard
+	// once-per-week guard on both the on-demand /weekly path and the
+	// Sunday cron path — they consult the same HasWeekRow marker so the
+	// user cannot receive two copies in the same ISO week regardless of
+	// which surface fires first.
+	weeklyRepo := postgres.NewWeeklyDeliveriesRepo(pool)
 	weeklyAssembler := digest.NewWeeklyAssembler(digest.WeeklyAssemblerDeps{
-		Settings:       settings,
-		Clusters:       clusters,
-		Weekly:         weeklyRepoBA,
-		Sources:        channelsRepo,
-		Sender:         sender,
-		Tier:           usersSvc,
-		Users:          usersRepo,
-		CustomTopics:   topicsSvc,
-		Centroider:     postgres.NewEmbeddingsRepo(pool),
-		SkipAntiRepeat: true,
+		Settings:     settings,
+		Clusters:     clusters,
+		Weekly:       weeklyRepo,
+		Sources:      channelsRepo,
+		Sender:       sender,
+		Tier:         usersSvc,
+		Users:        usersRepo,
+		CustomTopics: topicsSvc,
+		Centroider:   postgres.NewEmbeddingsRepo(pool),
 	})
 	weeklyAdapter := bot.WeeklyAssemblerFunc(func(ctx context.Context, u, tg int64) error {
 		return weeklyAssembler.BuildWeekly(ctx, digest.WeeklyRequest{UserID: u, TGUserID: tg})
