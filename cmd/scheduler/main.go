@@ -134,8 +134,14 @@ func run() error {
 // {times, tz} shape so the scheduler package stays free of schema knowledge.
 func newUsersLoader(pool *postgres.Pool) scheduler.LoadUsersFunc {
 	return func(ctx context.Context) ([]scheduler.UserSchedule, error) {
+		// weekly_active is true only for non-expired Pro users with
+		// weekly_enabled=true. Pulling it into the loader keeps cron
+		// blissfully free of tier knowledge — the SQL is the policy.
 		const q = `
-			SELECT u.id, u.tg_user_id, s.digest_schedule
+			SELECT u.id, u.tg_user_id, s.digest_schedule,
+			       (u.tier = 'pro'
+			        AND (u.tier_until IS NULL OR u.tier_until > now())
+			        AND s.weekly_enabled) AS weekly_active
 			FROM users u
 			JOIN user_settings s ON s.user_id = u.id
 			WHERE u.blocked = false`
@@ -151,7 +157,7 @@ func newUsersLoader(pool *postgres.Pool) scheduler.LoadUsersFunc {
 				us        scheduler.UserSchedule
 				schedJSON []byte
 			)
-			if err := rows.Scan(&us.UserID, &us.TGUserID, &schedJSON); err != nil {
+			if err := rows.Scan(&us.UserID, &us.TGUserID, &schedJSON, &us.WeeklyEnabled); err != nil {
 				return nil, fmt.Errorf("scan user schedule: %w", err)
 			}
 			var parsed struct {

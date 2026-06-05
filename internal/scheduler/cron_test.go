@@ -126,3 +126,129 @@ func TestCron_PerLocationScheduler(t *testing.T) {
 	require.Contains(t, c.schedulers, "Europe/Moscow")
 	require.Contains(t, c.schedulers, "UTC")
 }
+
+// TestCron_WeeklyJob_FiresSunday18Local advances a fake clock across Sunday
+// 18:00 in the user's TZ and asserts the weekly subject was published. The
+// daily 08:00 job in the same schedule must not interfere — the clock only
+// crosses the weekly at-time.
+func TestCron_WeeklyJob_FiresSunday18Local(t *testing.T) {
+	t.Parallel()
+
+	moscow, err := time.LoadLocation("Europe/Moscow")
+	require.NoError(t, err)
+	// Sunday 7 June 2026, 17:59 MSK — one minute before the weekly fires.
+	start := time.Date(2026, 6, 7, 17, 59, 0, 0, moscow)
+	fake := clockwork.NewFakeClockAt(start)
+
+	type captured struct {
+		subject string
+		payload any
+	}
+	var (
+		mu    sync.Mutex
+		calls []captured
+	)
+	publish := pubFunc(func(_ context.Context, subject string, payload any) error {
+		mu.Lock()
+		calls = append(calls, captured{subject: subject, payload: payload})
+		mu.Unlock()
+		return nil
+	})
+
+	c, err := NewCron(CronDeps{
+		LoadUsers: func(_ context.Context) ([]UserSchedule, error) {
+			return []UserSchedule{{
+				UserID: 1, TGUserID: 100,
+				Times: []string{"08:00"}, TZ: "Europe/Moscow",
+				WeeklyEnabled: true,
+			}}, nil
+		},
+		Publisher: publish, Clock: fake, Reload: time.Hour,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Stop() })
+
+	// Cross 18:00 MSK by advancing two minutes.
+	fake.Advance(2 * time.Minute)
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, x := range calls {
+			if x.subject == queue.SubjectDeliveryWeeklySched {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 25*time.Millisecond,
+		"weekly job should have published on Sunday 18:00 local")
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Find the weekly call and assert payload shape.
+	var found bool
+	for _, x := range calls {
+		if x.subject != queue.SubjectDeliveryWeeklySched {
+			continue
+		}
+		p, ok := x.payload.(map[string]any)
+		require.True(t, ok)
+		require.Equal(t, int64(1), p["user_id"])
+		require.Equal(t, int64(100), p["tg_user_id"])
+		found = true
+	}
+	require.True(t, found)
+}
+
+// TestCron_WeeklyJob_NoJobWhenDisabled asserts that weekly_enabled=false
+// users never get a weekly job registered, even when the clock crosses
+// Sunday 18:00.
+func TestCron_WeeklyJob_NoJobWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	moscow, err := time.LoadLocation("Europe/Moscow")
+	require.NoError(t, err)
+	start := time.Date(2026, 6, 7, 17, 59, 0, 0, moscow)
+	fake := clockwork.NewFakeClockAt(start)
+
+	var (
+		mu       sync.Mutex
+		gotSubjs []string
+	)
+	publish := pubFunc(func(_ context.Context, subject string, _ any) error {
+		mu.Lock()
+		gotSubjs = append(gotSubjs, subject)
+		mu.Unlock()
+		return nil
+	})
+
+	c, err := NewCron(CronDeps{
+		LoadUsers: func(_ context.Context) ([]UserSchedule, error) {
+			return []UserSchedule{{
+				UserID: 1, TGUserID: 100,
+				Times: []string{"08:00"}, TZ: "Europe/Moscow",
+				WeeklyEnabled: false,
+			}}, nil
+		},
+		Publisher: publish, Clock: fake, Reload: time.Hour,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Stop() })
+
+	fake.Advance(2 * time.Minute)
+	// Give gocron a moment to (not) fire.
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range gotSubjs {
+		require.NotEqual(t, queue.SubjectDeliveryWeeklySched, s,
+			"weekly subject must not be published when WeeklyEnabled=false")
+	}
+}

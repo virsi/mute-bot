@@ -16,11 +16,17 @@ import (
 // user gets a digest at which local times. Times are "HH:MM" strings
 // interpreted in the named TZ (IANA name like "Europe/Moscow"). Invalid
 // timezone falls back to UTC.
+//
+// WeeklyEnabled triggers a parallel Sunday-18:00 weekly digest job in the
+// same TZ. Set true only for Pro users whose user_settings.weekly_enabled
+// is true and whose subscription has not expired — the loader in
+// cmd/scheduler enforces both gates.
 type UserSchedule struct {
-	UserID   int64
-	TGUserID int64
-	Times    []string
-	TZ       string
+	UserID        int64
+	TGUserID      int64
+	Times         []string
+	TZ            string
+	WeeklyEnabled bool
 }
 
 // LoadUsersFunc is the source of truth for the cron's user list. It is
@@ -221,6 +227,30 @@ func (c *Cron) scheduleUserLocked(u UserSchedule) {
 		)
 		if err != nil {
 			continue
+		}
+	}
+	// Weekly Sunday-18:00 job runs in the user's TZ. Pro+weekly_enabled is
+	// enforced by the loader so the cron stays single-purpose: any user
+	// reaching this branch is already entitled.
+	if u.WeeklyEnabled {
+		weeklyAt := gocron.NewAtTime(18, 0, 0)
+		userID := u.UserID
+		tgUserID := u.TGUserID
+		_, err := s.NewJob(
+			gocron.WeeklyJob(1,
+				gocron.NewWeekdays(time.Sunday),
+				gocron.NewAtTimes(weeklyAt),
+			),
+			gocron.NewTask(func() {
+				_ = c.d.Publisher.Publish(context.Background(), queue.SubjectDeliveryWeeklySched,
+					map[string]any{
+						"user_id":    userID,
+						"tg_user_id": tgUserID,
+					})
+			}),
+		)
+		if err != nil {
+			return
 		}
 	}
 }
