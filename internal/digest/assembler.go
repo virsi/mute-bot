@@ -2,9 +2,12 @@ package digest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/pgvector/pgvector-go"
 
 	"github.com/virsi/mute-bot/internal/storage/postgres"
 )
@@ -12,6 +15,34 @@ import (
 // SettingsReader returns the per-user delivery settings.
 type SettingsReader interface {
 	Get(ctx context.Context, userID int64) (postgres.Settings, error)
+}
+
+// UserLoader fetches a user row by internal id. Used by the optional
+// custom-topic filter to find out the recipient's tier before paying for
+// the per-cluster centroid lookup.
+type UserLoader interface {
+	GetByID(ctx context.Context, id int64) (postgres.User, error)
+}
+
+// TierChecker classifies a loaded user as Pro/Free. Satisfied by
+// users.Service in production.
+type TierChecker interface {
+	IsPro(u postgres.User) bool
+}
+
+// TopicMatcher answers whether a cluster centroid matches at least one
+// of userID's custom topics. By convention, returns true for users with
+// no custom topics so Free users (gated from adding topics) keep the
+// default "see everything" behavior.
+type TopicMatcher interface {
+	MatchesAny(ctx context.Context, userID int64, centroid pgvector.Vector) (bool, error)
+}
+
+// Centroider returns the cosine centroid for a cluster's posts. Surfaces
+// postgres.ErrNoEmbeddings when the cluster has no embeddings yet so the
+// assembler can skip the filter for that cluster without dropping it.
+type Centroider interface {
+	ClusterCentroid(ctx context.Context, clusterID int64) (pgvector.Vector, error)
 }
 
 // ClustersSearcher returns active clusters that match a filter, scored
@@ -39,14 +70,27 @@ type Sender interface {
 	SendDigest(ctx context.Context, tgUserID int64, text string) error
 }
 
-// AssemblerDeps wires the assembler to its collaborators. All fields except
-// Now/HistoryWindow/MaxItems are required.
+// AssemblerDeps wires the assembler to its collaborators. All fields
+// except the Custom* group and Now/HistoryWindow/MaxItems/Logger are
+// required. The Custom* group is the M4 Pro-only custom-topic filter:
+// every field is nil-safe and a missing value disables the filter
+// entirely — useful for tests and for Phase 1 wiring that has not yet
+// adopted the Pro path.
 type AssemblerDeps struct {
 	Settings   SettingsReader
 	Clusters   ClustersSearcher
 	Deliveries DeliveriesRW
 	Sources    SourcesReader
 	Sender     Sender
+
+	// CustomTopics, Centroider, Tier and Users together gate the per-
+	// cluster custom-topic filter. The filter is skipped when any of
+	// these is nil OR the user is not Pro OR the user has no custom
+	// topics. See applyCustomTopicFilter for the precedence.
+	CustomTopics TopicMatcher
+	Centroider   Centroider
+	Tier         TierChecker
+	Users        UserLoader
 
 	// Now is injectable for tests; defaults to time.Now.
 	Now func() time.Time
@@ -128,6 +172,14 @@ func (a *Assembler) Assemble(ctx context.Context, req AssembleRequest) error {
 		return nil
 	}
 
+	clusters, err = a.applyCustomTopicFilter(ctx, req.UserID, clusters)
+	if err != nil {
+		return fmt.Errorf("custom topic filter: %w", err)
+	}
+	if len(clusters) == 0 {
+		return nil
+	}
+
 	items := make([]Item, 0, len(clusters))
 	for _, c := range clusters {
 		srcs, err := a.d.Sources.SourcesForCluster(ctx, c.ID)
@@ -169,6 +221,63 @@ func (a *Assembler) Assemble(ctx context.Context, req AssembleRequest) error {
 		}
 	}
 	return nil
+}
+
+// applyCustomTopicFilter drops clusters whose centroid does not match
+// any of userID's custom topics. The filter is intentionally a no-op
+// (returns clusters unchanged) when:
+//
+//   - Any of the Custom*/Tier/Users deps is nil — partial wiring keeps
+//     the legacy code paths working without forcing every caller to
+//     adopt the Pro filter at once.
+//   - The user lookup or tier check rules the recipient as non-Pro —
+//     Free users (who cannot add custom topics anyway) see all clusters.
+//
+// When the filter is active and a cluster has no embeddings yet
+// (ErrNoEmbeddings), the cluster passes through — preferring an
+// imperfect filter to silently dropping fresh clusters.
+//
+// INV-5 preserved: the cost paid here is one Postgres round trip per
+// cluster (centroid + EXISTS); no LLM call. Custom-topic embeddings are
+// computed once on /topics add, never on a digest assembly.
+func (a *Assembler) applyCustomTopicFilter(
+	ctx context.Context, userID int64, clusters []postgres.Cluster,
+) ([]postgres.Cluster, error) {
+	if a.d.CustomTopics == nil || a.d.Centroider == nil || a.d.Tier == nil || a.d.Users == nil {
+		return clusters, nil
+	}
+	u, err := a.d.Users.GetByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("load user: %w", err)
+	}
+	if !a.d.Tier.IsPro(u) {
+		return clusters, nil
+	}
+	kept := clusters[:0]
+	for _, c := range clusters {
+		cen, err := a.d.Centroider.ClusterCentroid(ctx, c.ID)
+		if err != nil {
+			if errors.Is(err, postgres.ErrNoEmbeddings) {
+				// No embeddings yet — keep the cluster rather than drop it.
+				kept = append(kept, c)
+				continue
+			}
+			a.d.Logger.WarnContext(ctx, "centroid lookup failed",
+				slog.Int64("cluster_id", c.ID), slog.Any("err", err))
+			continue
+		}
+		ok, err := a.d.CustomTopics.MatchesAny(ctx, userID, cen)
+		if err != nil {
+			a.d.Logger.WarnContext(ctx, "custom topic match failed",
+				slog.Int64("cluster_id", c.ID), slog.Any("err", err))
+			continue
+		}
+		if !ok {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	return kept, nil
 }
 
 func fallback(s, def string) string {
