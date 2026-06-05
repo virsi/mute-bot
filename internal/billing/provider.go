@@ -21,6 +21,11 @@ type Activation struct {
 	ProviderRef string
 	Plan        string
 	Duration    time.Duration
+	// PaymentMethodID is set by providers that support saved-card
+	// autopayment (YooKassa). Empty for Stars. billing.Service stores it
+	// on the subscription row so the renewer can charge the saved card
+	// when the subscription is about to expire.
+	PaymentMethodID string
 }
 
 // Provider is the abstraction every payment backend implements.
