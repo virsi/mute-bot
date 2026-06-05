@@ -133,3 +133,144 @@ func TestSubscriptionsRepo_LatestActive_NoneReturnsErrNoRows(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, pgx.ErrNoRows))
 }
+
+// TestSubscriptionsRepo_Insert_StoresPaymentMethodID locks in the M2
+// requirement: YooKassa rows carry the saved payment_method_id so the
+// renewer can charge the card later.
+func TestSubscriptionsRepo_Insert_StoresPaymentMethodID(t *testing.T) {
+	ctx := context.Background()
+	p := setupTestPool(t)
+	truncate(t, p, "subscriptions, users")
+	ur := NewUsersRepo(p)
+	sr := NewSubscriptionsRepo(p)
+	u, _, err := ur.GetOrCreate(ctx, 9201, "yk-pm-user")
+	require.NoError(t, err)
+	started := time.Now().UTC().Truncate(time.Second)
+	expires := started.Add(30 * 24 * time.Hour)
+
+	_, isNew, err := sr.Insert(ctx, SubscriptionInsert{
+		UserID: u.ID, Provider: "yookassa", ProviderRef: "pay-1",
+		Plan: "pro_30d_rub", StartedAt: started, ExpiresAt: &expires,
+		PaymentMethodID: "pm-1",
+	})
+	require.NoError(t, err)
+	require.True(t, isNew)
+
+	list, err := sr.ListByUser(ctx, u.ID)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Equal(t, "pm-1", list[0].PaymentMethodID)
+}
+
+// TestSubscriptionsRepo_Insert_EmptyPaymentMethodID_NullStored confirms
+// Stars rows (which have no saved card) land with NULL — the partial
+// renew index then ignores them as required.
+func TestSubscriptionsRepo_Insert_EmptyPaymentMethodID_NullStored(t *testing.T) {
+	ctx := context.Background()
+	p := setupTestPool(t)
+	truncate(t, p, "subscriptions, users")
+	ur := NewUsersRepo(p)
+	sr := NewSubscriptionsRepo(p)
+	u, _, err := ur.GetOrCreate(ctx, 9211, "stars-user")
+	require.NoError(t, err)
+	started := time.Now().UTC().Truncate(time.Second)
+	expires := started.Add(30 * 24 * time.Hour)
+
+	_, _, err = sr.Insert(ctx, SubscriptionInsert{
+		UserID: u.ID, Provider: "tg_stars", ProviderRef: "stars-ref-1",
+		Plan: "pro_30d", StartedAt: started, ExpiresAt: &expires,
+		// PaymentMethodID left empty
+	})
+	require.NoError(t, err)
+
+	var pm *string
+	err = p.Pool().QueryRow(ctx, `SELECT payment_method_id FROM subscriptions WHERE provider='tg_stars' AND provider_ref='stars-ref-1'`).Scan(&pm)
+	require.NoError(t, err)
+	require.Nil(t, pm, "empty PaymentMethodID must map to SQL NULL")
+}
+
+// TestSubscriptionsRepo_ListExpiring_WindowFilter returns only the row
+// whose expires_at falls inside the given window.
+func TestSubscriptionsRepo_ListExpiring_WindowFilter(t *testing.T) {
+	ctx := context.Background()
+	p := setupTestPool(t)
+	truncate(t, p, "subscriptions, users")
+	ur := NewUsersRepo(p)
+	sr := NewSubscriptionsRepo(p)
+	u, _, err := ur.GetOrCreate(ctx, 9202, "yk-window")
+	require.NoError(t, err)
+	// Manually mark Pro so the JOIN survives.
+	_, err = p.Pool().Exec(ctx, `UPDATE users SET tier='pro', tier_until=now()+interval '40 days' WHERE id=$1`, u.ID)
+	require.NoError(t, err)
+	soon := time.Now().Add(20 * time.Hour)
+	far := time.Now().Add(40 * 24 * time.Hour)
+	_, _, err = sr.Insert(ctx, SubscriptionInsert{
+		UserID: u.ID, Provider: "yookassa", ProviderRef: "p1",
+		Plan: "pro_30d_rub", StartedAt: time.Now(), ExpiresAt: &soon,
+		PaymentMethodID: "pm-1",
+	})
+	require.NoError(t, err)
+	_, _, err = sr.Insert(ctx, SubscriptionInsert{
+		UserID: u.ID, Provider: "yookassa", ProviderRef: "p2",
+		Plan: "pro_30d_rub", StartedAt: time.Now(), ExpiresAt: &far,
+		PaymentMethodID: "pm-1",
+	})
+	require.NoError(t, err)
+
+	out, err := sr.ListExpiring(ctx, 24*time.Hour)
+	require.NoError(t, err)
+	require.Len(t, out, 1, "DISTINCT ON keeps one row per user")
+	require.Equal(t, "pm-1", out[0].PaymentMethodID)
+	require.Equal(t, "yookassa", out[0].Provider)
+	require.Equal(t, int64(9202), out[0].TGUserID)
+}
+
+// TestSubscriptionsRepo_ListExpiring_SkipsRowsWithoutPaymentMethod
+// guarantees the renewer never tries to charge a Stars subscription —
+// the column is NULL so the partial index excludes the row.
+func TestSubscriptionsRepo_ListExpiring_SkipsRowsWithoutPaymentMethod(t *testing.T) {
+	ctx := context.Background()
+	p := setupTestPool(t)
+	truncate(t, p, "subscriptions, users")
+	ur := NewUsersRepo(p)
+	sr := NewSubscriptionsRepo(p)
+	u, _, err := ur.GetOrCreate(ctx, 9203, "stars-pro")
+	require.NoError(t, err)
+	_, err = p.Pool().Exec(ctx, `UPDATE users SET tier='pro', tier_until=now()+interval '40 days' WHERE id=$1`, u.ID)
+	require.NoError(t, err)
+	soon := time.Now().Add(20 * time.Hour)
+	_, _, err = sr.Insert(ctx, SubscriptionInsert{
+		UserID: u.ID, Provider: "tg_stars", ProviderRef: "s1",
+		Plan: "pro_30d", StartedAt: time.Now(), ExpiresAt: &soon,
+		// No payment_method_id — Stars rows leave it NULL.
+	})
+	require.NoError(t, err)
+
+	out, err := sr.ListExpiring(ctx, 24*time.Hour)
+	require.NoError(t, err)
+	require.Empty(t, out)
+}
+
+// TestSubscriptionsRepo_ListExpiring_SkipsFreeUsers locks in the Pro-gate
+// in the SQL: a Pro subscription row owned by a downgraded user must not
+// be auto-renewed.
+func TestSubscriptionsRepo_ListExpiring_SkipsFreeUsers(t *testing.T) {
+	ctx := context.Background()
+	p := setupTestPool(t)
+	truncate(t, p, "subscriptions, users")
+	ur := NewUsersRepo(p)
+	sr := NewSubscriptionsRepo(p)
+	u, _, err := ur.GetOrCreate(ctx, 9204, "downgrade")
+	require.NoError(t, err)
+	// User stays on free tier — the JOIN must filter them out.
+	soon := time.Now().Add(20 * time.Hour)
+	_, _, err = sr.Insert(ctx, SubscriptionInsert{
+		UserID: u.ID, Provider: "yookassa", ProviderRef: "p1",
+		Plan: "pro_30d_rub", StartedAt: time.Now(), ExpiresAt: &soon,
+		PaymentMethodID: "pm-1",
+	})
+	require.NoError(t, err)
+	out, err := sr.ListExpiring(ctx, 24*time.Hour)
+	require.NoError(t, err)
+	require.Empty(t, out)
+}
