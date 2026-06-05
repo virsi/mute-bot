@@ -39,6 +39,27 @@ func (s *SendOnly) Send(ctx context.Context, chatID int64, text string) error {
 	return nil
 }
 
+// SendURLButton pushes an HTML-parsed message with a single inline-keyboard
+// button that opens the supplied URL. Used by /buy to deliver the Stars
+// invoice link with a one-tap CTA. buttonText is the rendered label;
+// chatID is the destination chat.
+func (s *SendOnly) SendURLButton(ctx context.Context, chatID int64, text, buttonText, url string) error {
+	_, err := s.b.SendMessage(ctx, &tgbot.SendMessageParams{
+		ChatID:    chatID,
+		Text:      text,
+		ParseMode: models.ParseModeHTML,
+		ReplyMarkup: &models.InlineKeyboardMarkup{
+			InlineKeyboard: [][]models.InlineKeyboardButton{
+				{{Text: buttonText, URL: url}},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("send url-button message: %w", err)
+	}
+	return nil
+}
+
 // Client is the full Bot API used by cmd/bot-api for long-polling, command
 // handlers, sendInvoice, and pre-checkout webhooks. Embeds SendOnly so it
 // satisfies the API interface used by Sender.
