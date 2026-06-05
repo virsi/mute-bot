@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -179,9 +180,11 @@ func TestYooKassaProvider_HandlePayment_RejectsBadUserID(t *testing.T) {
 
 func TestYooKassaProvider_Renew_UsesSavedMethod(t *testing.T) {
 	var gotBody map[string]any
+	var gotKey string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v3/payments", r.URL.Path)
-		require.NotEmpty(t, r.Header.Get("Idempotence-Key"))
+		gotKey = r.Header.Get("Idempotence-Key")
+		require.NotEmpty(t, gotKey)
 		b, _ := io.ReadAll(r.Body)
 		require.NoError(t, json.Unmarshal(b, &gotBody))
 		_, _ = w.Write([]byte(`{"id":"pay-2","status":"succeeded"}`))
@@ -193,7 +196,8 @@ func TestYooKassaProvider_Renew_UsesSavedMethod(t *testing.T) {
 		BaseURL:    srv.URL,
 		HTTPClient: http.DefaultClient,
 	})
-	paymentID, err := p.Renew(context.Background(), 4242, "pm-1")
+	expires := time.Unix(1_750_000_000, 0).UTC()
+	paymentID, err := p.Renew(context.Background(), 4242, 99, expires, "pm-1")
 	require.NoError(t, err)
 	require.Equal(t, "pay-2", paymentID)
 	require.Equal(t, "pm-1", gotBody["payment_method_id"])
@@ -203,10 +207,19 @@ func TestYooKassaProvider_Renew_UsesSavedMethod(t *testing.T) {
 	meta := gotBody["metadata"].(map[string]any)
 	require.Equal(t, "4242", meta["tg_user_id"])
 	require.Equal(t, "1", meta["renewal"])
+
+	// Idempotence-Key is deterministic for (subscription_id, expires_at).
+	// A second call with the same arguments must reuse the same key so
+	// YooKassa collapses retries onto one payment instead of billing the
+	// card twice.
+	prevKey := gotKey
+	_, err = p.Renew(context.Background(), 4242, 99, expires, "pm-1")
+	require.NoError(t, err)
+	require.Equal(t, prevKey, gotKey, "Renew key must be deterministic per (sub, expiry)")
 }
 
 func TestYooKassaProvider_Renew_RejectsEmptyPaymentMethod(t *testing.T) {
 	p := NewYooKassaProvider(YooKassaDeps{ShopID: "x", SecretKey: "y"})
-	_, err := p.Renew(context.Background(), 1, "")
+	_, err := p.Renew(context.Background(), 1, 1, time.Now(), "")
 	require.Error(t, err)
 }

@@ -13,7 +13,7 @@ import (
 // Keeping it as an interface keeps the renewer unit tests free of a real
 // httptest server.
 type Renewer interface {
-	Renew(ctx context.Context, userID int64, paymentMethodID string) (string, error)
+	Renew(ctx context.Context, userID, subscriptionID int64, expiresAt time.Time, paymentMethodID string) (string, error)
 }
 
 // SubsExpiringReader is the subset of postgres.SubscriptionsRepo the
@@ -92,7 +92,7 @@ func (r *YooKassaRenewer) Step(ctx context.Context) error {
 		if e.Provider != "yookassa" {
 			continue
 		}
-		paymentID, err := r.d.Renewer.Renew(ctx, e.TGUserID, e.PaymentMethodID)
+		paymentID, err := r.d.Renewer.Renew(ctx, e.TGUserID, e.ID, e.ExpiresAt, e.PaymentMethodID)
 		if err != nil {
 			r.d.Logger.WarnContext(ctx, "renew failed",
 				slog.Int64("user_id", e.UserID),

@@ -139,13 +139,26 @@ func run() error {
 
 	// Billing wiring: StarsProvider over the live Bot API. YooKassa is
 	// optional — only enabled when shop_id + secret_key + base_external_url
-	// are all set so the bot keeps booting on Stars-only deployments.
-	// Service.Settle is the idempotent activation entry point invoked by
-	// the payment_handlers (Stars) and yookassa_webhook (YooKassa).
+	// AND webhook_secret are all set. Treating webhook_secret as required
+	// the moment YooKassa is enabled avoids the failure mode where the
+	// renewer charges saved cards but the matching webhook handler stays
+	// unmounted (yielding 404 for every payment.succeeded notification and
+	// leaving paid users on the Free tier).
 	starsProvider := billing.NewStarsProvider(client.Bot())
 	providers := map[string]billing.Provider{"tg_stars": starsProvider}
 	var ykProvider *billing.YooKassaProvider
-	if cfg.YooKassa.ShopID != "" && cfg.YooKassa.SecretKey != "" && cfg.BaseExternalURL != "" {
+	ykConfigured := cfg.YooKassa.ShopID != "" || cfg.YooKassa.SecretKey != "" ||
+		cfg.YooKassa.WebhookSecret != ""
+	if ykConfigured {
+		if cfg.YooKassa.ShopID == "" || cfg.YooKassa.SecretKey == "" ||
+			cfg.YooKassa.WebhookSecret == "" || cfg.BaseExternalURL == "" {
+			return fmt.Errorf("yookassa: shop_id, secret_key, webhook_secret and base_external_url must all be set together; got shop_id=%t secret_key=%t webhook_secret=%t base_external_url=%t",
+				cfg.YooKassa.ShopID != "",
+				cfg.YooKassa.SecretKey != "",
+				cfg.YooKassa.WebhookSecret != "",
+				cfg.BaseExternalURL != "",
+			)
+		}
 		ykProvider = billing.NewYooKassaProvider(billing.YooKassaDeps{
 			ShopID:     cfg.YooKassa.ShopID,
 			SecretKey:  cfg.YooKassa.SecretKey,
@@ -166,8 +179,11 @@ func run() error {
 		Settler: billingSvc,
 		API:     &client.SendOnly,
 	})
-	// Attach the YooKassa webhook to the shared HTTP mux when configured.
-	if ykProvider != nil && cfg.YooKassa.WebhookSecret != "" {
+	// Attach the YooKassa webhook to the shared HTTP mux. The startup
+	// guard above guarantees WebhookSecret is non-empty whenever the
+	// provider is enabled, so this branch fully commits the route or the
+	// provider was never instantiated in the first place.
+	if ykProvider != nil {
 		httpMux.Handle("/yookassa/webhook", billing.NewYooKassaWebhook(billing.YooKassaWebhookDeps{
 			Settler: billingSvc,
 			Secret:  cfg.YooKassa.WebhookSecret,

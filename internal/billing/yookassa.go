@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -220,7 +221,15 @@ func (p *YooKassaProvider) HandlePayment(_ context.Context, raw []byte) (Activat
 // initial payment.
 //
 // Returns the payment id so the renewer can log it.
-func (p *YooKassaProvider) Renew(ctx context.Context, userID int64, paymentMethodID string) (string, error) {
+//
+// The deterministic Idempotence-Key derived from (subscription_id,
+// expires_at_unix) means a renewer that ticks hourly and keeps picking
+// the same row out of ListExpiring sends the SAME Idempotence-Key on
+// every retry — YooKassa collapses them onto a single charge instead
+// of billing the card N times in the 24h pre-expiry window.
+func (p *YooKassaProvider) Renew(
+	ctx context.Context, userID, subscriptionID int64, expiresAt time.Time, paymentMethodID string,
+) (string, error) {
 	if paymentMethodID == "" {
 		return "", fmt.Errorf("yookassa renew: missing payment_method_id")
 	}
@@ -239,7 +248,8 @@ func (p *YooKassaProvider) Renew(ctx context.Context, userID int64, paymentMetho
 	if err != nil {
 		return "", fmt.Errorf("marshal renew body: %w", err)
 	}
-	resp, err := p.do(ctx, http.MethodPost, yooKassaPath, raw)
+	key := renewIdempotenceKey(subscriptionID, expiresAt)
+	resp, err := p.doWithKey(ctx, http.MethodPost, yooKassaPath, raw, key)
 	if err != nil {
 		return "", err
 	}
@@ -250,6 +260,15 @@ func (p *YooKassaProvider) Renew(ctx context.Context, userID int64, paymentMetho
 	return parsed.ID, nil
 }
 
+// renewIdempotenceKey derives a stable 32-char hex string from the
+// subscription id and its current expiration time. Two renewal attempts
+// before the row is replaced (so before YooKassa's webhook persists the
+// new subscription) share the same key, and YooKassa collapses them.
+func renewIdempotenceKey(subscriptionID int64, expiresAt time.Time) string {
+	h := sha256.Sum256(fmt.Appendf(nil, "renew:%d:%d", subscriptionID, expiresAt.Unix()))
+	return hex.EncodeToString(h[:16])
+}
+
 // do issues an authenticated request to YooKassa with a fresh
 // Idempotence-Key. Returns the raw response body or an error when the
 // HTTP status is non-2xx.
@@ -258,6 +277,12 @@ func (p *YooKassaProvider) do(ctx context.Context, method, path string, body []b
 	if err != nil {
 		return nil, fmt.Errorf("idempotence key: %w", err)
 	}
+	return p.doWithKey(ctx, method, path, body, key)
+}
+
+// doWithKey is the shared transport that takes the Idempotence-Key as
+// an argument so renewals can reuse a deterministic key.
+func (p *YooKassaProvider) doWithKey(ctx context.Context, method, path string, body []byte, key string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, p.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("new request: %w", err)

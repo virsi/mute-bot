@@ -21,14 +21,15 @@ type fakeRenewer struct {
 }
 
 type renewerCall struct {
-	userID int64
-	pmID   string
+	userID, subID int64
+	expiresAt     time.Time
+	pmID          string
 }
 
-func (f *fakeRenewer) Renew(_ context.Context, userID int64, pmID string) (string, error) {
+func (f *fakeRenewer) Renew(_ context.Context, userID, subID int64, expiresAt time.Time, pmID string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, renewerCall{userID, pmID})
+	f.calls = append(f.calls, renewerCall{userID, subID, expiresAt, pmID})
 	return f.paymentID, f.err
 }
 
@@ -65,7 +66,7 @@ type flakyRenewer struct {
 	attempts int
 }
 
-func (f *flakyRenewer) Renew(_ context.Context, _ int64, pmID string) (string, error) {
+func (f *flakyRenewer) Renew(_ context.Context, _, _ int64, _ time.Time, pmID string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.attempts++
